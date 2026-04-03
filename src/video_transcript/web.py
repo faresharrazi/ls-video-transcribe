@@ -1,0 +1,512 @@
+from __future__ import annotations
+
+import os
+from pathlib import Path
+
+from dotenv import load_dotenv
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse
+from pydantic import BaseModel
+import uvicorn
+
+from .transcriber import transcribe_livestorm_session_data
+
+
+APP_HTML = """<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Video Transcript</title>
+    <style>
+      :root {
+        --bg: #f4efe4;
+        --panel: rgba(255, 250, 241, 0.88);
+        --panel-strong: #fffaf1;
+        --text: #1f1b17;
+        --muted: #6b6257;
+        --accent: #0b6e4f;
+        --danger: #a4372f;
+        --border: rgba(31, 27, 23, 0.12);
+        --shadow: 0 18px 50px rgba(60, 40, 20, 0.12);
+      }
+
+      * { box-sizing: border-box; }
+      body {
+        margin: 0;
+        min-height: 100vh;
+        font-family: Georgia, "Times New Roman", serif;
+        color: var(--text);
+        background:
+          radial-gradient(circle at top left, rgba(209, 122, 34, 0.24), transparent 28%),
+          radial-gradient(circle at top right, rgba(11, 110, 79, 0.2), transparent 26%),
+          linear-gradient(135deg, #efe7d5 0%, #f9f6ef 46%, #ece4d2 100%);
+      }
+      .shell {
+        width: min(1120px, calc(100vw - 32px));
+        margin: 32px auto;
+        display: grid;
+        grid-template-columns: minmax(300px, 380px) minmax(0, 1fr);
+        gap: 24px;
+      }
+      .card {
+        background: var(--panel);
+        backdrop-filter: blur(10px);
+        border: 1px solid var(--border);
+        border-radius: 24px;
+        box-shadow: var(--shadow);
+      }
+      .sidebar { padding: 28px; }
+      .eyebrow {
+        display: inline-block;
+        margin-bottom: 12px;
+        padding: 6px 10px;
+        border-radius: 999px;
+        background: rgba(11, 110, 79, 0.08);
+        color: var(--accent);
+        font-size: 12px;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+      }
+      h1 {
+        margin: 0 0 12px;
+        font-size: clamp(2rem, 4vw, 3rem);
+        line-height: 0.95;
+      }
+      .lead {
+        margin: 0 0 24px;
+        color: var(--muted);
+        line-height: 1.6;
+      }
+      label {
+        display: block;
+        font-size: 0.95rem;
+        margin-bottom: 8px;
+      }
+      input[type="text"], input[type="password"] {
+        width: 100%;
+        padding: 14px 16px;
+        border: 1px solid var(--border);
+        border-radius: 14px;
+        background: #fffdfa;
+        font: inherit;
+        color: var(--text);
+      }
+      input[type="text"]:focus, input[type="password"]:focus {
+        outline: 2px solid rgba(11, 110, 79, 0.2);
+        border-color: rgba(11, 110, 79, 0.38);
+      }
+      .toggle {
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        margin-top: 16px;
+        padding: 14px 16px;
+        border-radius: 16px;
+        background: rgba(255, 253, 248, 0.8);
+        border: 1px solid var(--border);
+      }
+      .toggle input[type="checkbox"] {
+        width: 18px;
+        height: 18px;
+        accent-color: var(--accent);
+        margin: 0;
+      }
+      .toggle-copy {
+        display: flex;
+        flex-direction: column;
+        gap: 4px;
+      }
+      .toggle-copy strong { font-size: 0.96rem; }
+      .toggle-copy span {
+        color: var(--muted);
+        font-size: 0.88rem;
+        line-height: 1.4;
+      }
+      .actions {
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        margin-top: 16px;
+      }
+      button {
+        border: 0;
+        border-radius: 999px;
+        padding: 14px 20px;
+        background: linear-gradient(135deg, var(--accent), #0f8a64);
+        color: white;
+        font: inherit;
+        cursor: pointer;
+        transition: transform 120ms ease, box-shadow 120ms ease;
+        box-shadow: 0 12px 24px rgba(11, 110, 79, 0.18);
+      }
+      button:hover { transform: translateY(-1px); }
+      button:disabled {
+        opacity: 0.65;
+        cursor: wait;
+        transform: none;
+      }
+      .hint {
+        margin-top: 14px;
+        font-size: 0.92rem;
+        color: var(--muted);
+      }
+      .results {
+        padding: 24px;
+        display: flex;
+        flex-direction: column;
+        min-height: 70vh;
+      }
+      .status {
+        display: none;
+        margin-bottom: 18px;
+        padding: 14px 16px;
+        border-radius: 16px;
+        line-height: 1.5;
+      }
+      .status.visible { display: block; }
+      .status.info {
+        background: rgba(11, 110, 79, 0.08);
+        color: var(--accent);
+      }
+      .status.error {
+        background: rgba(164, 55, 47, 0.08);
+        color: var(--danger);
+      }
+      .metrics {
+        display: none;
+        grid-template-columns: repeat(4, minmax(0, 1fr));
+        gap: 12px;
+        margin-bottom: 18px;
+      }
+      .metrics.visible { display: grid; }
+      .metric {
+        padding: 14px;
+        border-radius: 18px;
+        background: var(--panel-strong);
+        border: 1px solid var(--border);
+      }
+      .metric span {
+        display: block;
+        color: var(--muted);
+        font-size: 0.82rem;
+        margin-bottom: 6px;
+      }
+      .metric strong {
+        font-size: 1rem;
+        word-break: break-word;
+      }
+      .panel {
+        padding: 18px;
+        border-radius: 20px;
+        background: rgba(255, 253, 248, 0.82);
+        border: 1px solid var(--border);
+      }
+      .panel + .panel { margin-top: 16px; }
+      .panel h2 {
+        margin: 0 0 12px;
+        font-size: 1rem;
+      }
+      .transcript {
+        white-space: pre-wrap;
+        line-height: 1.7;
+      }
+      pre {
+        margin: 0;
+        overflow: auto;
+        white-space: pre-wrap;
+        word-break: break-word;
+        font-family: "SFMono-Regular", Menlo, monospace;
+        font-size: 0.9rem;
+      }
+      .empty {
+        margin: auto 0;
+        text-align: center;
+        color: var(--muted);
+        line-height: 1.7;
+      }
+      @media (max-width: 900px) {
+        .shell { grid-template-columns: 1fr; }
+        .results { min-height: auto; }
+        .metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      }
+    </style>
+  </head>
+  <body>
+    <main class="shell">
+      <section class="card sidebar">
+        <div class="eyebrow">Livestorm to Transcript</div>
+        <h1>Session to JSON</h1>
+        <p class="lead">Paste a Livestorm session ID and the app will fetch the recording, transcribe it, and render the transcript plus the raw JSON output.</p>
+        <form id="transcript-form">
+          <label for="session-id">Session ID</label>
+          <input id="session-id" name="session_id" type="text" placeholder="fdbd0600-9a46-4755-b25b-21b51d4e29cb" autocomplete="off" required>
+          <label for="api-key">API Key</label>
+          <input id="api-key" name="api_key" type="password" placeholder="Optional unless server auth is enabled" autocomplete="off">
+          <label class="toggle" for="timestamped">
+            <input id="timestamped" name="timestamped" type="checkbox" checked>
+            <span class="toggle-copy">
+              <strong>Timestamped?</strong>
+              <span>Checked uses `whisper-1` and returns segment timestamps. Unchecked uses `gpt-4o-mini-transcribe` and returns plain JSON without segments.</span>
+            </span>
+          </label>
+          <div class="actions">
+            <button id="submit-btn" type="submit">Generate Transcript</button>
+          </div>
+        </form>
+        <p class="hint">Errors from missing keys, bad session IDs, expired download URLs, or upstream transcription failures are shown directly in the UI.</p>
+      </section>
+      <section class="card results">
+        <div id="status" class="status"></div>
+        <div id="metrics" class="metrics">
+          <div class="metric"><span>Session</span><strong id="metric-session">-</strong></div>
+          <div class="metric"><span>Language</span><strong id="metric-language">-</strong></div>
+          <div class="metric"><span>Duration</span><strong id="metric-duration">-</strong></div>
+          <div class="metric"><span>Segments</span><strong id="metric-segments">-</strong></div>
+        </div>
+        <div id="empty-state" class="empty">Transcript output will appear here once a session is processed.</div>
+        <div id="result-content" style="display:none;">
+          <div class="panel">
+            <h2>Transcript</h2>
+            <div id="transcript-text" class="transcript"></div>
+          </div>
+          <div class="panel">
+            <h2>JSON Output</h2>
+            <pre id="json-output"></pre>
+          </div>
+        </div>
+      </section>
+    </main>
+    <script>
+      const form = document.getElementById("transcript-form");
+      const button = document.getElementById("submit-btn");
+      const statusEl = document.getElementById("status");
+      const metricsEl = document.getElementById("metrics");
+      const emptyEl = document.getElementById("empty-state");
+      const resultContentEl = document.getElementById("result-content");
+      const transcriptTextEl = document.getElementById("transcript-text");
+      const jsonOutputEl = document.getElementById("json-output");
+
+      function setStatus(kind, message) {
+        statusEl.textContent = message;
+        statusEl.className = "status visible " + kind;
+      }
+
+      function clearStatus() {
+        statusEl.textContent = "";
+        statusEl.className = "status";
+      }
+
+      function setBusy(isBusy) {
+        button.disabled = isBusy;
+        button.textContent = isBusy ? "Working..." : "Generate Transcript";
+      }
+
+      function renderTranscript(data) {
+        document.getElementById("metric-session").textContent = data.session_id || "-";
+        document.getElementById("metric-language").textContent = data.language || "unknown";
+        document.getElementById("metric-duration").textContent = data.duration_seconds != null ? `${data.duration_seconds}s` : "-";
+        document.getElementById("metric-segments").textContent = Array.isArray(data.segments) ? String(data.segments.length) : "n/a";
+        transcriptTextEl.textContent = data.text || "(No transcript text returned)";
+        jsonOutputEl.textContent = JSON.stringify(data, null, 2);
+        metricsEl.classList.add("visible");
+        emptyEl.style.display = "none";
+        resultContentEl.style.display = "block";
+      }
+
+      function resetResult() {
+        metricsEl.classList.remove("visible");
+        emptyEl.style.display = "block";
+        resultContentEl.style.display = "none";
+        transcriptTextEl.textContent = "";
+        jsonOutputEl.textContent = "";
+      }
+
+      form.addEventListener("submit", async (event) => {
+        event.preventDefault();
+        const sessionId = document.getElementById("session-id").value.trim();
+        const apiKey = document.getElementById("api-key").value.trim();
+        const timestamped = document.getElementById("timestamped").checked;
+
+        if (!sessionId) {
+          resetResult();
+          setStatus("error", "Please enter a Livestorm session ID.");
+          return;
+        }
+
+        setBusy(true);
+        clearStatus();
+        resetResult();
+        setStatus("info", timestamped
+          ? "Fetching recording and generating a timestamped transcript with whisper-1. Large recordings can take a while."
+          : "Fetching recording and generating a plain JSON transcript with gpt-4o-mini-transcribe. Large recordings can take a while.");
+
+        try {
+          const headers = { "Content-Type": "application/json" };
+          if (apiKey) {
+            headers["X-API-Key"] = apiKey;
+          }
+
+          const response = await fetch("/api/transcribe", {
+            method: "POST",
+            headers,
+            body: JSON.stringify({ session_id: sessionId, timestamped })
+          });
+
+          const payload = await response.json();
+          if (!response.ok) {
+            throw new Error(payload.error || "Unknown server error");
+          }
+
+          clearStatus();
+          renderTranscript(payload.transcript);
+        } catch (error) {
+          resetResult();
+          setStatus("error", error.message || "Something went wrong while generating the transcript.");
+        } finally {
+          setBusy(false);
+        }
+      });
+    </script>
+  </body>
+</html>
+"""
+
+
+class TranscriptRequest(BaseModel):
+    session_id: str
+    timestamped: bool = True
+
+
+def _configured_api_key() -> str | None:
+    load_dotenv()
+    return os.getenv("API_AUTH_KEY") or os.getenv("TRANSCRIPT_API_KEY")
+
+
+def _parse_bool(value: object, default: bool = True) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    normalized = str(value).strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    return default
+
+
+def _build_output_path(session_id: str, timestamped: bool) -> Path:
+    suffix = "timestamped" if timestamped else "plain"
+    output_dir = Path.cwd() / "outputs"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    return output_dir / f"{session_id}.{suffix}.transcript.json"
+
+
+def _transcribe_request(session_id: str, timestamped: bool) -> dict[str, object]:
+    session_id = session_id.strip()
+    if not session_id:
+        raise HTTPException(status_code=400, detail="Session ID is required.")
+
+    output_path = _build_output_path(session_id, timestamped)
+    try:
+        transcript = transcribe_livestorm_session_data(
+            session_id=session_id,
+            output_path=output_path,
+            timestamped=timestamped,
+        )
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        message = str(exc)
+        status_code = 502
+        if "Missing OpenAI API key" in message or "Missing Livestorm API key" in message:
+            status_code = 500
+        elif "No MP4 video recording found" in message:
+            status_code = 404
+        raise HTTPException(status_code=status_code, detail=message) from exc
+
+    return {"transcript": transcript}
+
+
+def _validate_api_key(
+    x_api_key: str | None = Header(default=None),
+    authorization: str | None = Header(default=None),
+) -> None:
+    configured_key = _configured_api_key()
+    if not configured_key:
+        return
+
+    provided_key = None
+    if x_api_key:
+        provided_key = x_api_key.strip()
+    elif authorization and authorization.lower().startswith("bearer "):
+        provided_key = authorization[7:].strip()
+
+    if provided_key != configured_key:
+        raise HTTPException(
+            status_code=401,
+            detail="Provide a valid API key via X-API-Key or Authorization: Bearer <key>.",
+        )
+
+
+def create_app() -> FastAPI:
+    load_dotenv()
+    app = FastAPI(title="Video Transcript API", version="0.1.0")
+
+    cors_origins = os.getenv("CORS_ALLOW_ORIGINS", "").strip()
+    if cors_origins:
+        origins = [origin.strip() for origin in cors_origins.split(",") if origin.strip()]
+        if origins:
+            app.add_middleware(
+                CORSMiddleware,
+                allow_origins=origins if origins != ["*"] else ["*"],
+                allow_credentials=True,
+                allow_methods=["*"],
+                allow_headers=["*"],
+            )
+
+    @app.exception_handler(HTTPException)
+    async def _http_exception_handler(_: Request, exc: HTTPException):
+        return fastapi_json_response({"error": "Unauthorized." if exc.status_code == 401 else exc.detail}, exc.status_code)
+
+    @app.exception_handler(Exception)
+    async def _generic_exception_handler(_: Request, exc: Exception):
+        return fastapi_json_response({"error": f"Unexpected server error while generating the transcript."}, 500)
+
+    @app.get("/", response_class=HTMLResponse)
+    async def root() -> HTMLResponse:
+        return HTMLResponse(APP_HTML)
+
+    @app.get("/health")
+    async def health() -> dict[str, str]:
+        return {"status": "ok"}
+
+    @app.get("/api/transcribe", dependencies=[Depends(_validate_api_key)])
+    async def get_transcript(
+        session_id: str = Query(...),
+        verbose: str = Query("true"),
+    ) -> dict[str, object]:
+        return _transcribe_request(session_id=session_id, timestamped=_parse_bool(verbose, default=True))
+
+    @app.post("/api/transcribe", dependencies=[Depends(_validate_api_key)])
+    async def post_transcript(payload: TranscriptRequest) -> dict[str, object]:
+        return _transcribe_request(session_id=payload.session_id, timestamped=payload.timestamped)
+
+    return app
+
+
+def fastapi_json_response(payload: dict[str, object], status_code: int):
+    from fastapi.responses import JSONResponse
+
+    return JSONResponse(content=payload, status_code=status_code)
+
+
+app = create_app()
+
+
+def run_server(host: str | None = None, port: int | None = None) -> None:
+    resolved_host = host or os.getenv("HOST", "0.0.0.0")
+    resolved_port = port or int(os.getenv("PORT", "8000"))
+    uvicorn.run("video_transcript.web:app", host=resolved_host, port=resolved_port, reload=False)

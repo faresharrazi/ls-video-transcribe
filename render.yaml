@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: video-transcript-api
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn --app-dir src video_transcript.web:app --host 0.0.0.0 --port $PORT
+    plan: starter
+    healthCheckPath: /health
+    envVars:
+      - key: OPENAI_KEY
+        sync: false
+      - key: LS_API_KEY
+        sync: false
+      - key: API_AUTH_KEY
+        sync: false
+      - key: CORS_ALLOW_ORIGINS
+        sync: false
