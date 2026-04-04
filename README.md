@@ -15,6 +15,7 @@ Small Python app with:
 - It downloads the recording only after resolving the MP4 URL from Livestorm.
 - It defaults to `whisper-1` because timestamped `verbose_json` output currently requires a timestamp-capable model.
 - If you request a model that does not support timestamped `verbose_json`, the app automatically falls back to `whisper-1`.
+- For non-timestamped transcription, extracted audio is automatically split when it exceeds `20 MB` or when it runs longer than `8 minutes`, each chunk is transcribed with `gpt-4o-mini-transcribe`, and the text is concatenated before being returned to the UI or API.
 
 ## Setup
 

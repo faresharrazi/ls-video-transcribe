@@ -11,10 +11,14 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-import imageio_ffmpeg
+try:
+    import imageio_ffmpeg
+except ModuleNotFoundError:
+    imageio_ffmpeg = None
 from dotenv import load_dotenv
 from openai import APIError, BadRequestError, OpenAI
 
+from .chunked_transcription import transcribe_audio_json
 
 DEFAULT_MODEL = "gpt-4o-mini-transcribe"
 TIMESTAMPED_MODEL = "whisper-1"
@@ -43,7 +47,18 @@ def _resolve_livestorm_api_key() -> str:
 
 
 def _ffmpeg_executable() -> str:
-    return imageio_ffmpeg.get_ffmpeg_exe()
+    if imageio_ffmpeg is not None:
+        return imageio_ffmpeg.get_ffmpeg_exe()
+
+    system_ffmpeg = shutil.which("ffmpeg")
+    if system_ffmpeg:
+        return system_ffmpeg
+
+    raise RuntimeError(
+        "FFmpeg is required but not available. Install the Python package "
+        "`imageio-ffmpeg` with `pip install -r requirements.txt` or install "
+        "a system `ffmpeg` binary and make sure it is on your PATH."
+    )
 
 
 def _extract_audio(video_path: Path, audio_path: Path) -> None:
@@ -96,6 +111,27 @@ def _resolve_transcription_request(
     }
 
 
+def _extract_openai_error_message(exc: Exception) -> str | None:
+    body = getattr(exc, "body", None)
+    if isinstance(body, dict):
+        error = body.get("error")
+        if isinstance(error, dict):
+            message = error.get("message")
+            if isinstance(message, str) and message.strip():
+                return message.strip()
+        message = body.get("message")
+        if isinstance(message, str) and message.strip():
+            return message.strip()
+
+    for attr in ("message",):
+        value = getattr(exc, attr, None)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+
+    rendered = str(exc).strip()
+    return rendered or None
+
+
 def _normalize_transcription(
     response: Any,
     source_video: Path,
@@ -122,6 +158,16 @@ def _normalize_transcription(
         "text": payload.get("text", ""),
         "usage": payload.get("usage"),
     }
+    if "chunked" in payload:
+        result["chunked"] = payload.get("chunked")
+    if "chunk_count" in payload:
+        result["chunk_count"] = payload.get("chunk_count")
+    if "chunk_size_limit_bytes" in payload:
+        result["chunk_size_limit_bytes"] = payload.get("chunk_size_limit_bytes")
+    if "chunk_duration_limit_seconds" in payload:
+        result["chunk_duration_limit_seconds"] = payload.get("chunk_duration_limit_seconds")
+    if payload.get("chunks"):
+        result["chunks"] = payload.get("chunks")
     if timestamped:
         result["segments"] = [
             {
@@ -230,26 +276,34 @@ def transcribe_video(
         temp_audio = Path(temp_dir) / f"{source_video.stem}.mp3"
         _extract_audio(source_video, temp_audio)
 
-        request_kwargs: dict[str, Any] = {
-            "model": transcription_request["actual_model"],
-            "response_format": transcription_request["response_format"],
-        }
-        if transcription_request["timestamp_granularities"] is not None:
-            request_kwargs["timestamp_granularities"] = transcription_request["timestamp_granularities"]
-        if language:
-            request_kwargs["language"] = language
+        if transcription_request["timestamped"]:
+            request_kwargs: dict[str, Any] = {
+                "model": transcription_request["actual_model"],
+                "response_format": transcription_request["response_format"],
+            }
+            if transcription_request["timestamp_granularities"] is not None:
+                request_kwargs["timestamp_granularities"] = transcription_request["timestamp_granularities"]
+            if language:
+                request_kwargs["language"] = language
 
-        with temp_audio.open("rb") as audio_handle:
-            request_kwargs["file"] = audio_handle
-            try:
-                response = client.audio.transcriptions.create(**request_kwargs)
-            except BadRequestError as exc:
-                message = None
-                if getattr(exc, "body", None):
-                    message = exc.body.get("error", {}).get("message")
-                raise RuntimeError(message or "OpenAI rejected the transcription request.") from exc
-            except APIError as exc:
-                raise RuntimeError(f"OpenAI transcription failed: {exc}") from exc
+            with temp_audio.open("rb") as audio_handle:
+                request_kwargs["file"] = audio_handle
+                try:
+                    response: Any = client.audio.transcriptions.create(**request_kwargs)
+                except BadRequestError as exc:
+                    message = _extract_openai_error_message(exc)
+                    raise RuntimeError(message or "OpenAI rejected the transcription request.") from exc
+                except APIError as exc:
+                    raise RuntimeError(f"OpenAI transcription failed: {exc}") from exc
+        else:
+            response = transcribe_audio_json(
+                client=client,
+                audio_path=temp_audio,
+                model=transcription_request["actual_model"],
+                ffmpeg_executable=_ffmpeg_executable(),
+                error_message_extractor=_extract_openai_error_message,
+                language=language,
+            )
 
         extracted_audio: Path | None = None
         if keep_audio:
