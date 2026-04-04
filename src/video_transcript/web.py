@@ -1,16 +1,29 @@
 from __future__ import annotations
 
+import json
+import logging
 import os
+import queue
+import threading
+import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
+from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel
 import uvicorn
 
 from .transcriber import transcribe_livestorm_session_data
+
+logger = logging.getLogger(__name__)
+JOB_STATUS_QUEUED = "queued"
+JOB_STATUS_RUNNING = "running"
+JOB_STATUS_COMPLETED = "completed"
+JOB_STATUS_FAILED = "failed"
 
 
 APP_HTML = """<!doctype html>
@@ -377,6 +390,16 @@ APP_HTML = """<!doctype html>
 class TranscriptRequest(BaseModel):
     session_id: str
     timestamped: bool = True
+    async_mode: bool = False
+
+
+class TranscriptJobRequest(BaseModel):
+    session_id: str
+    timestamped: bool = True
+
+
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
 
 def _configured_api_key() -> str | None:
@@ -404,30 +427,183 @@ def _build_output_path(session_id: str, timestamped: bool) -> Path:
     return output_dir / f"{session_id}.{suffix}.transcript.json"
 
 
-def _transcribe_request(session_id: str, timestamped: bool) -> dict[str, object]:
-    session_id = session_id.strip()
-    if not session_id:
-        raise HTTPException(status_code=400, detail="Session ID is required.")
+def _build_jobs_dir() -> Path:
+    jobs_dir = Path.cwd() / "outputs" / "jobs"
+    jobs_dir.mkdir(parents=True, exist_ok=True)
+    return jobs_dir
 
-    output_path = _build_output_path(session_id, timestamped)
-    try:
-        transcript = transcribe_livestorm_session_data(
-            session_id=session_id,
-            output_path=output_path,
-            timestamped=timestamped,
-        )
-    except FileNotFoundError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
-    except RuntimeError as exc:
+
+def _build_job_path(job_id: str) -> Path:
+    return _build_jobs_dir() / f"{job_id}.json"
+
+
+def _serialize_transcription_exception(exc: Exception) -> tuple[int, str]:
+    if isinstance(exc, ValueError):
+        return 400, str(exc)
+    if isinstance(exc, FileNotFoundError):
+        return 404, str(exc)
+    if isinstance(exc, RuntimeError):
         message = str(exc)
         status_code = 502
         if "Missing OpenAI API key" in message or "Missing Livestorm API key" in message:
             status_code = 500
         elif "No MP4 video recording found" in message:
             status_code = 404
-        raise HTTPException(status_code=status_code, detail=message) from exc
+        return status_code, message
+    return 500, "Unexpected server error while generating the transcript."
+
+
+def _perform_transcription(session_id: str, timestamped: bool) -> dict[str, object]:
+    session_id = session_id.strip()
+    if not session_id:
+        raise ValueError("Session ID is required.")
+
+    output_path = _build_output_path(session_id, timestamped)
+    transcript = transcribe_livestorm_session_data(
+        session_id=session_id,
+        output_path=output_path,
+        timestamped=timestamped,
+    )
 
     return {"transcript": transcript}
+
+
+def _transcribe_request(session_id: str, timestamped: bool) -> dict[str, object]:
+    try:
+        return _perform_transcription(session_id=session_id, timestamped=timestamped)
+    except Exception as exc:
+        status_code, detail = _serialize_transcription_exception(exc)
+        raise HTTPException(status_code=status_code, detail=detail) from exc
+
+
+class TranscriptJobManager:
+    def __init__(self) -> None:
+        self._queue: queue.Queue[str] = queue.Queue()
+        self._thread: threading.Thread | None = None
+        self._lock = threading.Lock()
+        self._queued_job_ids: set[str] = set()
+
+    def start(self) -> None:
+        with self._lock:
+            if self._thread and self._thread.is_alive():
+                return
+            self._recover_jobs_locked()
+            self._thread = threading.Thread(
+                target=self._worker_loop,
+                name="transcript-job-worker",
+                daemon=True,
+            )
+            self._thread.start()
+
+    def enqueue(self, session_id: str, timestamped: bool) -> dict[str, object]:
+        normalized_session_id = session_id.strip()
+        if not normalized_session_id:
+            raise HTTPException(status_code=400, detail="Session ID is required.")
+
+        job_id = uuid.uuid4().hex
+        job = {
+            "job_id": job_id,
+            "session_id": normalized_session_id,
+            "timestamped": timestamped,
+            "status": JOB_STATUS_QUEUED,
+            "created_at": _utc_now_iso(),
+            "updated_at": _utc_now_iso(),
+            "result": None,
+            "error": None,
+        }
+        self._write_job(job)
+        self._enqueue_job_id(job_id)
+        return job
+
+    def get(self, job_id: str) -> dict[str, object]:
+        job = self._read_job(job_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail="Transcript job not found.")
+        return job
+
+    def _enqueue_job_id(self, job_id: str) -> None:
+        with self._lock:
+            if job_id in self._queued_job_ids:
+                return
+            self._queued_job_ids.add(job_id)
+            self._queue.put(job_id)
+
+    def _recover_jobs_locked(self) -> None:
+        for job_file in _build_jobs_dir().glob("*.json"):
+            try:
+                job = json.loads(job_file.read_text())
+            except (OSError, json.JSONDecodeError):
+                logger.exception("Unable to read queued transcript job from %s", job_file)
+                continue
+
+            if job.get("status") not in {JOB_STATUS_QUEUED, JOB_STATUS_RUNNING}:
+                continue
+
+            job["status"] = JOB_STATUS_QUEUED
+            job["updated_at"] = _utc_now_iso()
+            self._write_job(job)
+            job_id = str(job.get("job_id") or "").strip()
+            if job_id and job_id not in self._queued_job_ids:
+                self._queued_job_ids.add(job_id)
+                self._queue.put(job_id)
+
+    def _worker_loop(self) -> None:
+        while True:
+            job_id = self._queue.get()
+            with self._lock:
+                self._queued_job_ids.discard(job_id)
+
+            job = self._read_job(job_id)
+            if job is None:
+                self._queue.task_done()
+                continue
+
+            job["status"] = JOB_STATUS_RUNNING
+            job["updated_at"] = _utc_now_iso()
+            self._write_job(job)
+
+            try:
+                result = _perform_transcription(
+                    session_id=str(job["session_id"]),
+                    timestamped=bool(job["timestamped"]),
+                )
+            except Exception as exc:
+                status_code, detail = _serialize_transcription_exception(exc)
+                logger.exception("Transcript job %s failed", job_id, exc_info=exc)
+                job["status"] = JOB_STATUS_FAILED
+                job["updated_at"] = _utc_now_iso()
+                job["error"] = {
+                    "message": detail,
+                    "status_code": status_code,
+                }
+                job["result"] = None
+            else:
+                job["status"] = JOB_STATUS_COMPLETED
+                job["updated_at"] = _utc_now_iso()
+                job["result"] = result
+                job["error"] = None
+
+            self._write_job(job)
+            self._queue.task_done()
+
+    def _read_job(self, job_id: str) -> dict[str, object] | None:
+        job_path = _build_job_path(job_id)
+        if not job_path.exists():
+            return None
+        try:
+            return json.loads(job_path.read_text())
+        except (OSError, json.JSONDecodeError):
+            logger.exception("Unable to read transcript job state from %s", job_path)
+            raise HTTPException(status_code=500, detail="Unable to read transcript job state.")
+
+    def _write_job(self, job: dict[str, object]) -> None:
+        job_path = _build_job_path(str(job["job_id"]))
+        temp_path = job_path.with_suffix(".json.tmp")
+        temp_path.write_text(json.dumps(job, indent=2, ensure_ascii=True) + "\n")
+        temp_path.replace(job_path)
+
+
+job_manager = TranscriptJobManager()
 
 
 def _validate_api_key(
@@ -473,7 +649,12 @@ def create_app() -> FastAPI:
 
     @app.exception_handler(Exception)
     async def _generic_exception_handler(_: Request, exc: Exception):
+        logger.exception("Unexpected server error while generating transcript", exc_info=exc)
         return fastapi_json_response({"error": f"Unexpected server error while generating the transcript."}, 500)
+
+    @app.on_event("startup")
+    async def _startup() -> None:
+        job_manager.start()
 
     @app.get("/", response_class=HTMLResponse)
     async def root() -> HTMLResponse:
@@ -487,12 +668,49 @@ def create_app() -> FastAPI:
     async def get_transcript(
         session_id: str = Query(...),
         verbose: str = Query("true"),
+        async_mode: str = Query("false"),
     ) -> dict[str, object]:
-        return _transcribe_request(session_id=session_id, timestamped=_parse_bool(verbose, default=True))
+        if _parse_bool(async_mode, default=False):
+            job = job_manager.enqueue(
+                session_id=session_id,
+                timestamped=_parse_bool(verbose, default=True),
+            )
+            return fastapi_json_response(job, 202)
+        return await run_in_threadpool(
+            _transcribe_request,
+            session_id=session_id,
+            timestamped=_parse_bool(verbose, default=True),
+        )
 
     @app.post("/api/transcribe", dependencies=[Depends(_validate_api_key)])
     async def post_transcript(payload: TranscriptRequest) -> dict[str, object]:
-        return _transcribe_request(session_id=payload.session_id, timestamped=payload.timestamped)
+        if payload.async_mode:
+            return fastapi_json_response(
+                job_manager.enqueue(
+                    session_id=payload.session_id,
+                    timestamped=payload.timestamped,
+                ),
+                202,
+            )
+        return await run_in_threadpool(
+            _transcribe_request,
+            session_id=payload.session_id,
+            timestamped=payload.timestamped,
+        )
+
+    @app.post("/api/transcribe/jobs", dependencies=[Depends(_validate_api_key)])
+    async def create_transcript_job(payload: TranscriptJobRequest):
+        return fastapi_json_response(
+            job_manager.enqueue(
+                session_id=payload.session_id,
+                timestamped=payload.timestamped,
+            ),
+            202,
+        )
+
+    @app.get("/api/transcribe/jobs/{job_id}", dependencies=[Depends(_validate_api_key)])
+    async def get_transcript_job(job_id: str) -> dict[str, object]:
+        return job_manager.get(job_id)
 
     return app
 

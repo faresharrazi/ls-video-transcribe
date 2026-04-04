@@ -154,6 +154,31 @@ curl -X POST "http://127.0.0.1:8000/api/transcribe" \
   -d '{"session_id":"SESSION_ID","timestamped":true}'
 ```
 
+Safer production pattern for long transcriptions:
+
+```bash
+curl -X POST "http://127.0.0.1:8000/api/transcribe/jobs" \
+  -H "X-API-Key: your-shared-secret" \
+  -H "Content-Type: application/json" \
+  -d '{"session_id":"SESSION_ID","timestamped":true}'
+```
+
+That returns `202 Accepted` with a `job_id`. Then poll:
+
+```bash
+curl "http://127.0.0.1:8000/api/transcribe/jobs/JOB_ID" \
+  -H "X-API-Key: your-shared-secret"
+```
+
+Job states:
+
+- `queued`
+- `running`
+- `completed`
+- `failed`
+
+You can also opt into async mode on the existing endpoint by sending `"async_mode": true` in `POST /api/transcribe` or `async_mode=true` on the `GET` query string.
+
 Successful response shape:
 
 ```json
