@@ -1,12 +1,16 @@
 from __future__ import annotations
 
+import http.client
 import json
+import mimetypes
 import os
 import shutil
 import subprocess
 import tempfile
+import time
 import urllib.error
 import urllib.request
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -16,25 +20,28 @@ try:
 except ModuleNotFoundError:
     imageio_ffmpeg = None
 from dotenv import load_dotenv
-from openai import APIError, BadRequestError, OpenAI
 
-from .chunked_transcription import transcribe_audio_json
-
-DEFAULT_MODEL = "gpt-4o-mini-transcribe"
-TIMESTAMPED_MODEL = "whisper-1"
-NON_TIMESTAMPED_MODEL = "gpt-4o-mini-transcribe"
+DEFAULT_MODEL = "gladia-v2-pre-recorded"
 DEFAULT_AUDIO_BITRATE = "32k"
 DEFAULT_AUDIO_SAMPLE_RATE = 16000
+GLADIA_API_BASE = "https://api.gladia.io"
+GLADIA_UPLOAD_PATH = "/v2/upload"
+GLADIA_PRE_RECORDED_PATH = "/v2/pre-recorded"
+GLADIA_POLL_INTERVAL_SECONDS = 3
+GLADIA_POLL_TIMEOUT_SECONDS = 30 * 60
 LIVESTORM_API_BASE = "https://api.livestorm.co/v1"
+DEFAULT_GLADIA_OPTIONS: dict[str, Any] = {
+    "diarization": True,
+    "named_entity_recognition": True,
+    "sentences": True,
+}
 
 
 def _resolve_api_key() -> str:
     load_dotenv()
-    api_key = os.getenv("OPENAI_KEY") or os.getenv("OPENAI_API_KEY")
+    api_key = os.getenv("GLADIA_KEY")
     if not api_key:
-        raise RuntimeError(
-            "Missing OpenAI API key. Set OPENAI_KEY or OPENAI_API_KEY in your environment or .env file."
-        )
+        raise RuntimeError("Missing Gladia API key. Set GLADIA_KEY in your environment or .env file.")
     return api_key
 
 
@@ -85,111 +92,249 @@ def _extract_audio(video_path: Path, audio_path: Path) -> None:
         raise RuntimeError(f"Audio extraction failed: {stderr}") from exc
 
 
-def _resolve_transcription_request(
-    requested_model: str | None,
-    timestamped: bool,
-    include_word_timestamps: bool,
+def _json_request(
+    *,
+    method: str,
+    url: str,
+    api_key: str,
+    payload: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    if timestamped:
-        timestamp_granularities = ["segment"]
-        if include_word_timestamps:
-            timestamp_granularities.append("word")
-        return {
-            "requested_model": requested_model or TIMESTAMPED_MODEL,
-            "actual_model": TIMESTAMPED_MODEL,
-            "response_format": "verbose_json",
-            "timestamp_granularities": timestamp_granularities,
-            "timestamped": True,
-        }
-
-    return {
-        "requested_model": requested_model or NON_TIMESTAMPED_MODEL,
-        "actual_model": NON_TIMESTAMPED_MODEL,
-        "response_format": "json",
-        "timestamp_granularities": None,
-        "timestamped": False,
+    data: bytes | None = None
+    headers = {
+        "accept": "application/json",
+        "x-gladia-key": api_key,
     }
+    if payload is not None:
+        data = json.dumps(payload).encode("utf-8")
+        headers["content-type"] = "application/json"
+
+    request = urllib.request.Request(url=url, data=data, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(request) as response:
+            return json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        details = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"Gladia API request failed with HTTP {exc.code}: {details}") from exc
+    except urllib.error.URLError as exc:
+        raise RuntimeError(f"Gladia API request failed: {exc.reason}") from exc
 
 
-def _extract_openai_error_message(exc: Exception) -> str | None:
-    body = getattr(exc, "body", None)
-    if isinstance(body, dict):
-        error = body.get("error")
-        if isinstance(error, dict):
-            message = error.get("message")
-            if isinstance(message, str) and message.strip():
-                return message.strip()
-        message = body.get("message")
-        if isinstance(message, str) and message.strip():
-            return message.strip()
+def _upload_audio_file(audio_path: Path, api_key: str) -> dict[str, Any]:
+    mime_type = mimetypes.guess_type(audio_path.name)[0] or "application/octet-stream"
+    boundary = f"gladia-{uuid.uuid4().hex}"
+    preamble = (
+        f"--{boundary}\r\n"
+        f'Content-Disposition: form-data; name="audio"; filename="{audio_path.name}"\r\n'
+        f"Content-Type: {mime_type}\r\n\r\n"
+    ).encode("utf-8")
+    epilogue = f"\r\n--{boundary}--\r\n".encode("utf-8")
+    content_length = len(preamble) + audio_path.stat().st_size + len(epilogue)
 
-    for attr in ("message",):
-        value = getattr(exc, attr, None)
-        if isinstance(value, str) and value.strip():
-            return value.strip()
+    connection = http.client.HTTPSConnection("api.gladia.io", timeout=120)
+    try:
+        connection.putrequest("POST", GLADIA_UPLOAD_PATH)
+        connection.putheader("x-gladia-key", api_key)
+        connection.putheader("Content-Type", f"multipart/form-data; boundary={boundary}")
+        connection.putheader("Accept", "application/json")
+        connection.putheader("Content-Length", str(content_length))
+        connection.endheaders()
+        connection.send(preamble)
+        with audio_path.open("rb") as audio_handle:
+            while True:
+                chunk = audio_handle.read(1024 * 1024)
+                if not chunk:
+                    break
+                connection.send(chunk)
+        connection.send(epilogue)
 
-    rendered = str(exc).strip()
-    return rendered or None
+        response = connection.getresponse()
+        body = response.read().decode("utf-8", errors="replace")
+        if response.status >= 400:
+            raise RuntimeError(f"Gladia upload failed with HTTP {response.status}: {body}")
+        return json.loads(body) if body else {}
+    except OSError as exc:
+        raise RuntimeError(f"Gladia upload failed: {exc}") from exc
+    finally:
+        connection.close()
+
+
+def _deep_merge(base: dict[str, Any], updates: dict[str, Any]) -> dict[str, Any]:
+    merged = dict(base)
+    for key, value in updates.items():
+        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key] = _deep_merge(dict(merged[key]), value)
+            continue
+        merged[key] = value
+    return merged
+
+
+def _build_gladia_request(audio_url: str, gladia_options: dict[str, Any] | None = None) -> dict[str, Any]:
+    request_payload: dict[str, Any] = _deep_merge({}, DEFAULT_GLADIA_OPTIONS)
+    if gladia_options:
+        request_payload = _deep_merge(request_payload, gladia_options)
+    request_payload["diarization"] = True
+    request_payload["named_entity_recognition"] = True
+    request_payload["sentences"] = True
+    request_payload.pop("audio_to_llm", None)
+    request_payload.pop("audio_to_llm_config", None)
+    request_payload["audio_url"] = audio_url
+    return request_payload
+
+
+def _start_gladia_transcription(audio_url: str, api_key: str, gladia_options: dict[str, Any] | None = None) -> dict[str, Any]:
+    payload = _build_gladia_request(audio_url, gladia_options)
+    return _json_request(
+        method="POST",
+        url=f"{GLADIA_API_BASE}{GLADIA_PRE_RECORDED_PATH}",
+        api_key=api_key,
+        payload=payload,
+    )
+
+
+def _poll_gladia_transcription(job_id: str, api_key: str) -> dict[str, Any]:
+    deadline = time.monotonic() + GLADIA_POLL_TIMEOUT_SECONDS
+    last_payload: dict[str, Any] | None = None
+
+    while time.monotonic() < deadline:
+        payload = _json_request(
+            method="GET",
+            url=f"{GLADIA_API_BASE}{GLADIA_PRE_RECORDED_PATH}/{job_id}",
+            api_key=api_key,
+        )
+        last_payload = payload
+        status = str(payload.get("status") or "").strip().lower()
+        if status == "done":
+            return payload
+        if status == "error":
+            error_code = payload.get("error_code")
+            raise RuntimeError(f"Gladia transcription failed with status=error and error_code={error_code}.")
+        time.sleep(GLADIA_POLL_INTERVAL_SECONDS)
+
+    raise RuntimeError(
+        f"Timed out while waiting for Gladia transcription job {job_id}. "
+        f"Last status: {last_payload.get('status') if last_payload else 'unknown'}."
+    )
+
+
+def _extract_text_segments(result_payload: dict[str, Any]) -> tuple[str, list[dict[str, Any]], list[dict[str, Any]]]:
+    result = result_payload.get("result")
+    if not isinstance(result, dict):
+        return "", [], []
+
+    transcription = result.get("transcription")
+    if not isinstance(transcription, dict):
+        return "", [], []
+
+    full_transcript = str(transcription.get("full_transcript") or "").strip()
+    utterances = transcription.get("utterances")
+    words = transcription.get("words")
+
+    segments: list[dict[str, Any]] = []
+    if isinstance(utterances, list):
+        for index, utterance in enumerate(utterances, start=1):
+            if not isinstance(utterance, dict):
+                continue
+            segments.append(
+                {
+                    "id": utterance.get("id", index),
+                    "start": utterance.get("start"),
+                    "end": utterance.get("end"),
+                    "speaker": utterance.get("speaker"),
+                    "confidence": utterance.get("confidence"),
+                    "text": str(utterance.get("text") or "").strip(),
+                }
+            )
+
+    normalized_words: list[dict[str, Any]] = []
+    if isinstance(words, list):
+        for word in words:
+            if not isinstance(word, dict):
+                continue
+            normalized_words.append(
+                {
+                    "word": word.get("word"),
+                    "start": word.get("start"),
+                    "end": word.get("end"),
+                    "speaker": word.get("speaker"),
+                    "confidence": word.get("confidence"),
+                }
+            )
+
+    return full_transcript, segments, normalized_words
+
+
+def _extract_duration_seconds(gladia_payload: dict[str, Any]) -> float | None:
+    file_data = gladia_payload.get("file")
+    if isinstance(file_data, dict):
+        for key in ("audio_duration", "duration"):
+            value = file_data.get(key)
+            if isinstance(value, (int, float)):
+                return float(value)
+
+    result = gladia_payload.get("result")
+    if isinstance(result, dict):
+        metadata = result.get("metadata")
+        if isinstance(metadata, dict):
+            for key in ("audio_duration", "duration"):
+                value = metadata.get(key)
+                if isinstance(value, (int, float)):
+                    return float(value)
+
+    return None
+
+
+def _extract_language(gladia_payload: dict[str, Any]) -> str | None:
+    result = gladia_payload.get("result")
+    if not isinstance(result, dict):
+        return None
+
+    transcription = result.get("transcription")
+    if isinstance(transcription, dict):
+        languages = transcription.get("languages")
+        if isinstance(languages, list) and languages:
+            first_language = languages[0]
+            if isinstance(first_language, str) and first_language.strip():
+                return first_language.strip()
+
+    metadata = result.get("metadata")
+    if isinstance(metadata, dict):
+        language = metadata.get("language")
+        if isinstance(language, str) and language.strip():
+            return language.strip()
+
+    return None
 
 
 def _normalize_transcription(
-    response: Any,
+    gladia_payload: dict[str, Any],
+    *,
     source_video: Path,
     extracted_audio: Path | None,
     requested_model: str,
     actual_model: str,
-    timestamped: bool,
     session_id: str | None = None,
     recording: dict[str, Any] | None = None,
+    upload_payload: dict[str, Any] | None = None,
+    gladia_request: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    payload = response.model_dump() if hasattr(response, "model_dump") else dict(response)
-    segments = payload.get("segments", []) or []
-    words = payload.get("words", []) or []
-
-    result = {
-        "source_video": str(source_video.resolve()),
-        "extracted_audio": str(extracted_audio.resolve()) if extracted_audio else None,
-        "model": actual_model,
-        "requested_model": requested_model,
-        "timestamped": timestamped,
-        "created_at": datetime.now(timezone.utc).isoformat(),
-        "language": payload.get("language"),
-        "duration_seconds": payload.get("duration"),
-        "text": payload.get("text", ""),
-        "usage": payload.get("usage"),
-    }
-    if "chunked" in payload:
-        result["chunked"] = payload.get("chunked")
-    if "chunk_count" in payload:
-        result["chunk_count"] = payload.get("chunk_count")
-    if "chunk_size_limit_bytes" in payload:
-        result["chunk_size_limit_bytes"] = payload.get("chunk_size_limit_bytes")
-    if "chunk_duration_limit_seconds" in payload:
-        result["chunk_duration_limit_seconds"] = payload.get("chunk_duration_limit_seconds")
-    if payload.get("chunks"):
-        result["chunks"] = payload.get("chunks")
-    if timestamped:
-        result["segments"] = [
-            {
-                "id": segment.get("id"),
-                "start": segment.get("start"),
-                "end": segment.get("end"),
-                "text": (segment.get("text") or "").strip(),
-            }
-            for segment in segments
-        ]
-        result["words"] = [
-            {
-                "word": word.get("word"),
-                "start": word.get("start"),
-                "end": word.get("end"),
-            }
-            for word in words
-        ]
+    text, segments, words = _extract_text_segments(gladia_payload)
+    normalized = dict(gladia_payload)
+    normalized["provider"] = "gladia"
+    normalized["source_video"] = str(source_video.resolve())
+    normalized["extracted_audio"] = str(extracted_audio.resolve()) if extracted_audio else None
+    normalized["model"] = actual_model
+    normalized["requested_model"] = requested_model
+    normalized["timestamped"] = True
+    normalized["created_at"] = datetime.now(timezone.utc).isoformat()
+    normalized["text"] = text
+    normalized["language"] = _extract_language(gladia_payload)
+    normalized["duration_seconds"] = _extract_duration_seconds(gladia_payload)
+    normalized["segments"] = segments
+    normalized["words"] = words
     if session_id:
-        result["session_id"] = session_id
+        normalized["session_id"] = session_id
     if recording:
-        result["recording"] = {
+        normalized["recording"] = {
             "id": recording.get("id"),
             "event_id": recording.get("attributes", {}).get("event_id"),
             "session_id": recording.get("attributes", {}).get("session_id"),
@@ -200,7 +345,11 @@ def _normalize_transcription(
             "url_generated_at": recording.get("attributes", {}).get("url_generated_at"),
             "url_expires_in": recording.get("attributes", {}).get("url_expires_in"),
         }
-    return result
+    if upload_payload is not None:
+        normalized["upload"] = upload_payload
+    if gladia_request is not None:
+        normalized["request_payload"] = gladia_request
+    return normalized
 
 
 def _fetch_livestorm_recordings(session_id: str) -> dict[str, Any]:
@@ -252,11 +401,9 @@ def transcribe_video(
     input_path: str | Path,
     output_path: str | Path | None = None,
     *,
-    model: str | None = None,
-    timestamped: bool = True,
-    include_word_timestamps: bool = False,
+    provider: str | None = None,
     keep_audio: bool = False,
-    language: str | None = None,
+    gladia_options: dict[str, Any] | None = None,
 ) -> Path:
     source_video = Path(input_path).expanduser().resolve()
     if not source_video.exists():
@@ -269,41 +416,24 @@ def transcribe_video(
 
     output_file.parent.mkdir(parents=True, exist_ok=True)
 
-    client = OpenAI(api_key=_resolve_api_key())
-    transcription_request = _resolve_transcription_request(model, timestamped, include_word_timestamps)
+    api_key = _resolve_api_key()
+    requested_model = provider or DEFAULT_MODEL
+    actual_model = DEFAULT_MODEL
 
     with tempfile.TemporaryDirectory(prefix="video-transcript-") as temp_dir:
         temp_audio = Path(temp_dir) / f"{source_video.stem}.mp3"
         _extract_audio(source_video, temp_audio)
+        upload_payload = _upload_audio_file(temp_audio, api_key)
+        audio_url = upload_payload.get("audio_url")
+        if not isinstance(audio_url, str) or not audio_url.strip():
+            raise RuntimeError("Gladia upload succeeded but no audio_url was returned.")
 
-        if transcription_request["timestamped"]:
-            request_kwargs: dict[str, Any] = {
-                "model": transcription_request["actual_model"],
-                "response_format": transcription_request["response_format"],
-            }
-            if transcription_request["timestamp_granularities"] is not None:
-                request_kwargs["timestamp_granularities"] = transcription_request["timestamp_granularities"]
-            if language:
-                request_kwargs["language"] = language
-
-            with temp_audio.open("rb") as audio_handle:
-                request_kwargs["file"] = audio_handle
-                try:
-                    response: Any = client.audio.transcriptions.create(**request_kwargs)
-                except BadRequestError as exc:
-                    message = _extract_openai_error_message(exc)
-                    raise RuntimeError(message or "OpenAI rejected the transcription request.") from exc
-                except APIError as exc:
-                    raise RuntimeError(f"OpenAI transcription failed: {exc}") from exc
-        else:
-            response = transcribe_audio_json(
-                client=client,
-                audio_path=temp_audio,
-                model=transcription_request["actual_model"],
-                ffmpeg_executable=_ffmpeg_executable(),
-                error_message_extractor=_extract_openai_error_message,
-                language=language,
-            )
+        gladia_request = _build_gladia_request(audio_url, gladia_options)
+        started_job = _start_gladia_transcription(audio_url, api_key, gladia_options)
+        job_id = started_job.get("id")
+        if not isinstance(job_id, str) or not job_id.strip():
+            raise RuntimeError("Gladia transcription request succeeded but no job id was returned.")
+        gladia_result = _poll_gladia_transcription(job_id, api_key)
 
         extracted_audio: Path | None = None
         if keep_audio:
@@ -311,13 +441,15 @@ def transcribe_video(
             shutil.copy2(temp_audio, extracted_audio)
 
         normalized = _normalize_transcription(
-            response=response,
+            gladia_payload=gladia_result,
             source_video=source_video,
             extracted_audio=extracted_audio,
-            requested_model=transcription_request["requested_model"],
-            actual_model=transcription_request["actual_model"],
-            timestamped=transcription_request["timestamped"],
+            requested_model=requested_model,
+            actual_model=actual_model,
+            upload_payload=upload_payload,
+            gladia_request=gladia_request,
         )
+        normalized["job"] = started_job
         output_file.write_text(json.dumps(normalized, indent=2, ensure_ascii=True) + "\n")
 
     return output_file
@@ -327,12 +459,10 @@ def transcribe_livestorm_session(
     session_id: str,
     output_path: str | Path | None = None,
     *,
-    model: str | None = None,
-    timestamped: bool = True,
-    include_word_timestamps: bool = False,
+    provider: str | None = None,
     keep_audio: bool = False,
     keep_video: bool = False,
-    language: str | None = None,
+    gladia_options: dict[str, Any] | None = None,
 ) -> Path:
     payload = _fetch_livestorm_recordings(session_id)
     recording = _select_recording(payload)
@@ -359,11 +489,9 @@ def transcribe_livestorm_session(
         transcript_path = transcribe_video(
             input_path=downloaded_video,
             output_path=output_file,
-            model=model,
-            timestamped=timestamped,
-            include_word_timestamps=include_word_timestamps,
+            provider=provider,
             keep_audio=keep_audio,
-            language=language,
+            gladia_options=gladia_options,
         )
 
         transcript_payload = json.loads(transcript_path.read_text())
@@ -391,22 +519,18 @@ def transcribe_livestorm_session_data(
     session_id: str,
     output_path: str | Path | None = None,
     *,
-    model: str | None = None,
-    timestamped: bool = True,
-    include_word_timestamps: bool = False,
+    provider: str | None = None,
     keep_audio: bool = False,
     keep_video: bool = False,
-    language: str | None = None,
+    gladia_options: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     transcript_path = transcribe_livestorm_session(
         session_id=session_id,
         output_path=output_path,
-        model=model,
-        timestamped=timestamped,
-        include_word_timestamps=include_word_timestamps,
+        provider=provider,
         keep_audio=keep_audio,
         keep_video=keep_video,
-        language=language,
+        gladia_options=gladia_options,
     )
     transcript_payload = json.loads(transcript_path.read_text())
     transcript_payload["output_path"] = str(transcript_path.resolve())

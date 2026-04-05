@@ -2,7 +2,7 @@
 
 Small Python app with:
 
-- a CLI that takes a Livestorm `session_id`, fetches the recording metadata from the Livestorm API, downloads the `.mp4`, extracts lightweight mono audio, sends that audio to OpenAI speech-to-text, and writes a timestamped JSON transcript
+- a CLI that takes a Livestorm `session_id`, fetches the recording metadata from the Livestorm API, downloads the `.mp4`, extracts a mono MP3, uploads the full audio to Gladia, and writes the resulting verbose JSON transcript
 - a local web UI where you paste a session ID and get the transcript plus raw JSON output
 - a FastAPI-based HTTP API that other apps can call with a session ID and a `verbose` flag
 
@@ -13,9 +13,9 @@ Small Python app with:
 - It resamples to `16 kHz`.
 - It compresses the extracted audio to a low bitrate MP3 before upload.
 - It downloads the recording only after resolving the MP4 URL from Livestorm.
-- It defaults to `whisper-1` because timestamped `verbose_json` output currently requires a timestamp-capable model.
-- If you request a model that does not support timestamped `verbose_json`, the app automatically falls back to `whisper-1`.
-- For non-timestamped transcription, extracted audio is automatically split when it exceeds `20 MB` or when it runs longer than `8 minutes`, each chunk is transcribed with `gpt-4o-mini-transcribe`, and the text is concatenated before being returned to the UI or API.
+- It extracts audio locally so Gladia receives the full MP3 rather than the source video file.
+- It keeps the API session-based so other apps can continue calling the same endpoints.
+- It always requests the same Gladia profile: diarization, named entity recognition, and sentences.
 
 ## Setup
 
@@ -27,7 +27,7 @@ python3 -m venv .venv
 Your `.env` should contain:
 
 ```bash
-OPENAI_KEY=...
+GLADIA_KEY=...
 LS_API_KEY=...
 API_AUTH_KEY=your-shared-secret
 ```
@@ -52,12 +52,6 @@ Custom output path:
 .venv/bin/python main.py SESSION_ID --output out/transcript.json
 ```
 
-Include per-word timestamps:
-
-```bash
-.venv/bin/python main.py SESSION_ID --word-timestamps
-```
-
 Keep the extracted MP3:
 
 ```bash
@@ -70,10 +64,10 @@ Keep the downloaded MP4 too:
 .venv/bin/python main.py SESSION_ID --keep-video
 ```
 
-Pick a different model or provide a language hint:
+Record a different provider label:
 
 ```bash
-.venv/bin/python main.py SESSION_ID --model whisper-1 --language en
+.venv/bin/python main.py SESSION_ID --provider gladia-v2-pre-recorded
 ```
 
 Optional, if you want the `video-transcript` shell command instead of `python main.py`:
@@ -141,8 +135,8 @@ curl "http://127.0.0.1:8000/api/transcribe?session_id=SESSION_ID&verbose=true" \
 Notes:
 
 - `GET` request bodies are not reliable on the public internet, so the API uses query params for `GET`
-- `verbose=true` means timestamped output via `whisper-1` with `segments`
-- `verbose=false` means plain JSON via `gpt-4o-mini-transcribe` without `segments`
+- `verbose` is preserved for compatibility and is effectively always on with the Gladia integration
+- the backend always includes diarization, named entity recognition, and sentences in the Gladia request
 - if `API_AUTH_KEY` or `TRANSCRIPT_API_KEY` is set, requests must send either `X-API-Key: ...` or `Authorization: Bearer ...`
 
 You can also call it with `POST` and a JSON body:
@@ -186,8 +180,9 @@ Successful response shape:
   "transcript": {
     "session_id": "SESSION_ID",
     "timestamped": true,
-    "model": "whisper-1",
-    "requested_model": "whisper-1",
+    "provider": "gladia",
+    "model": "gladia-v2-pre-recorded",
+    "requested_model": "gladia-v2-pre-recorded",
     "text": "Transcript text here"
   }
 }
@@ -211,7 +206,7 @@ Recommended deployment steps:
 2. In Render, create a new Blueprint or Web Service from the repo.
 3. Use a paid plan such as `Starter` for production use.
 4. Set these environment variables in Render:
-   `OPENAI_KEY`, `LS_API_KEY`, `API_AUTH_KEY`
+   `GLADIA_KEY`, `LS_API_KEY`, `API_AUTH_KEY`
 5. Optionally set `CORS_ALLOW_ORIGINS` to a comma-separated list of allowed frontend origins, or `*` if you intentionally want public browser access.
 
 Render start command:
@@ -241,14 +236,15 @@ The JSON contains:
 - `source_video`
 - `extracted_audio`
 - `recording`
+- `provider`
 - `model`
+- `requested_model`
 - `created_at`
 - `language`
 - `duration_seconds`
 - `text`
 - `segments`
 - `words`
-- `usage`
 
 Segment entries look like:
 

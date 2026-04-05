@@ -5,13 +5,12 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "video-transcript"
 version = "0.1.0"
-description = "Transcribe MP4 files into timestamped JSON using OpenAI speech-to-text."
+description = "Transcribe Livestorm recordings into verbose JSON using Gladia."
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
   "fastapi>=0.115.0",
   "imageio-ffmpeg>=0.6.0",
-  "openai>=2.30.0",
   "python-dotenv>=1.2.2",
   "uvicorn>=0.32.0",
 ]

@@ -8,7 +8,7 @@ from .transcriber import DEFAULT_MODEL, transcribe_livestorm_session
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Fetch a Livestorm session recording and transcribe it into timestamped JSON."
+        description="Fetch a Livestorm session recording and transcribe it into verbose JSON via Gladia."
     )
     parser.add_argument("session_id", help="Livestorm session ID.")
     parser.add_argument(
@@ -17,18 +17,9 @@ def build_parser() -> argparse.ArgumentParser:
         help="Path to the JSON output file. Defaults to <recording-file>.transcript.json",
     )
     parser.add_argument(
-        "--model",
+        "--provider",
         default=DEFAULT_MODEL,
-        help=f"OpenAI transcription model to use. Default: {DEFAULT_MODEL}",
-    )
-    parser.add_argument(
-        "--language",
-        help="Optional language hint, such as 'en' or 'fr'.",
-    )
-    parser.add_argument(
-        "--word-timestamps",
-        action="store_true",
-        help="Include per-word timestamps in addition to segment timestamps.",
+        help=f"Provider label to record in output metadata. Default: {DEFAULT_MODEL}",
     )
     parser.add_argument(
         "--keep-audio",
@@ -50,11 +41,9 @@ def main() -> None:
     output_path = transcribe_livestorm_session(
         session_id=args.session_id,
         output_path=Path(args.output).expanduser() if args.output else None,
-        model=args.model,
-        include_word_timestamps=args.word_timestamps,
+        provider=args.provider,
         keep_audio=args.keep_audio,
         keep_video=args.keep_video,
-        language=args.language,
     )
     print(output_path)
 

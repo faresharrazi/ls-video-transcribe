@@ -1,4 +1,4 @@
-"""Utilities for transcribing video files into timestamped JSON."""
+"""Utilities for transcribing Livestorm recordings into verbose JSON."""
 
 from .transcriber import (
     transcribe_livestorm_session,

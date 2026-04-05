@@ -7,7 +7,7 @@ services:
     plan: starter
     healthCheckPath: /health
     envVars:
-      - key: OPENAI_KEY
+      - key: GLADIA_KEY
         sync: false
       - key: LS_API_KEY
         sync: false

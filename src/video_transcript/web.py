@@ -8,6 +8,7 @@ import threading
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
@@ -57,10 +58,10 @@ APP_HTML = """<!doctype html>
           linear-gradient(135deg, #efe7d5 0%, #f9f6ef 46%, #ece4d2 100%);
       }
       .shell {
-        width: min(1120px, calc(100vw - 32px));
+        width: min(1260px, calc(100vw - 32px));
         margin: 32px auto;
         display: grid;
-        grid-template-columns: minmax(300px, 380px) minmax(0, 1fr);
+        grid-template-columns: minmax(320px, 460px) minmax(0, 1fr);
         gap: 24px;
       }
       .card {
@@ -92,12 +93,15 @@ APP_HTML = """<!doctype html>
         color: var(--muted);
         line-height: 1.6;
       }
+      .field {
+        margin-bottom: 14px;
+      }
       label {
         display: block;
         font-size: 0.95rem;
         margin-bottom: 8px;
       }
-      input[type="text"], input[type="password"] {
+      input[type="text"], input[type="password"], textarea {
         width: 100%;
         padding: 14px 16px;
         border: 1px solid var(--border);
@@ -106,25 +110,29 @@ APP_HTML = """<!doctype html>
         font: inherit;
         color: var(--text);
       }
-      input[type="text"]:focus, input[type="password"]:focus {
+      textarea {
+        min-height: 110px;
+        resize: vertical;
+      }
+      input[type="text"]:focus, input[type="password"]:focus, textarea:focus {
         outline: 2px solid rgba(11, 110, 79, 0.2);
         border-color: rgba(11, 110, 79, 0.38);
       }
       .toggle {
         display: flex;
-        align-items: center;
+        align-items: flex-start;
         gap: 12px;
-        margin-top: 16px;
         padding: 14px 16px;
         border-radius: 16px;
         background: rgba(255, 253, 248, 0.8);
         border: 1px solid var(--border);
       }
+      .toggle + .toggle { margin-top: 10px; }
       .toggle input[type="checkbox"] {
         width: 18px;
         height: 18px;
         accent-color: var(--accent);
-        margin: 0;
+        margin: 2px 0 0;
       }
       .toggle-copy {
         display: flex;
@@ -141,7 +149,7 @@ APP_HTML = """<!doctype html>
         display: flex;
         align-items: center;
         gap: 12px;
-        margin-top: 16px;
+        margin-top: 18px;
       }
       button {
         border: 0;
@@ -164,6 +172,7 @@ APP_HTML = """<!doctype html>
         margin-top: 14px;
         font-size: 0.92rem;
         color: var(--muted);
+        line-height: 1.5;
       }
       .results {
         padding: 24px;
@@ -239,10 +248,13 @@ APP_HTML = """<!doctype html>
         color: var(--muted);
         line-height: 1.7;
       }
-      @media (max-width: 900px) {
+      @media (max-width: 980px) {
         .shell { grid-template-columns: 1fr; }
         .results { min-height: auto; }
         .metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      }
+      @media (max-width: 640px) {
+        .metrics { grid-template-columns: 1fr; }
       }
     </style>
   </head>
@@ -250,25 +262,22 @@ APP_HTML = """<!doctype html>
     <main class="shell">
       <section class="card sidebar">
         <div class="eyebrow">Livestorm to Transcript</div>
-        <h1>Session to JSON</h1>
-        <p class="lead">Paste a Livestorm session ID and the app will fetch the recording, transcribe it, and render the transcript plus the raw JSON output.</p>
+        <h1>Gladia Session to JSON</h1>
+        <p class="lead">Paste a Livestorm session ID and the app will fetch the recording, extract the full MP3, send it to Gladia, and return the resulting JSON plus a readable transcript preview.</p>
         <form id="transcript-form">
-          <label for="session-id">Session ID</label>
-          <input id="session-id" name="session_id" type="text" placeholder="fdbd0600-9a46-4755-b25b-21b51d4e29cb" autocomplete="off" required>
-          <label for="api-key">API Key</label>
-          <input id="api-key" name="api_key" type="password" placeholder="Optional unless server auth is enabled" autocomplete="off">
-          <label class="toggle" for="timestamped">
-            <input id="timestamped" name="timestamped" type="checkbox" checked>
-            <span class="toggle-copy">
-              <strong>Timestamped?</strong>
-              <span>Checked uses `whisper-1` and returns segment timestamps. Unchecked uses `gpt-4o-mini-transcribe` and returns plain JSON without segments.</span>
-            </span>
-          </label>
+          <div class="field">
+            <label for="session-id">Session ID</label>
+            <input id="session-id" name="session_id" type="text" placeholder="fdbd0600-9a46-4755-b25b-21b51d4e29cb" autocomplete="off" required>
+          </div>
+          <div class="field">
+            <label for="api-key">API Key</label>
+            <input id="api-key" name="api_key" type="password" placeholder="Optional unless server auth is enabled" autocomplete="off">
+          </div>
           <div class="actions">
             <button id="submit-btn" type="submit">Generate Transcript</button>
           </div>
         </form>
-        <p class="hint">Errors from missing keys, bad session IDs, expired download URLs, or upstream transcription failures are shown directly in the UI.</p>
+        <p class="hint">Every request now includes the same Gladia profile: diarization, named entity recognition, and sentences.</p>
       </section>
       <section class="card results">
         <div id="status" class="status"></div>
@@ -316,12 +325,22 @@ APP_HTML = """<!doctype html>
         button.textContent = isBusy ? "Working..." : "Generate Transcript";
       }
 
+      function transcriptText(data) {
+        if (data.text) {
+          return data.text;
+        }
+        if (data.result && data.result.transcription && data.result.transcription.full_transcript) {
+          return data.result.transcription.full_transcript;
+        }
+        return "(No transcript text returned)";
+      }
+
       function renderTranscript(data) {
         document.getElementById("metric-session").textContent = data.session_id || "-";
         document.getElementById("metric-language").textContent = data.language || "unknown";
         document.getElementById("metric-duration").textContent = data.duration_seconds != null ? `${data.duration_seconds}s` : "-";
         document.getElementById("metric-segments").textContent = Array.isArray(data.segments) ? String(data.segments.length) : "n/a";
-        transcriptTextEl.textContent = data.text || "(No transcript text returned)";
+        transcriptTextEl.textContent = transcriptText(data);
         jsonOutputEl.textContent = JSON.stringify(data, null, 2);
         metricsEl.classList.add("visible");
         emptyEl.style.display = "none";
@@ -340,7 +359,6 @@ APP_HTML = """<!doctype html>
         event.preventDefault();
         const sessionId = document.getElementById("session-id").value.trim();
         const apiKey = document.getElementById("api-key").value.trim();
-        const timestamped = document.getElementById("timestamped").checked;
 
         if (!sessionId) {
           resetResult();
@@ -351,9 +369,7 @@ APP_HTML = """<!doctype html>
         setBusy(true);
         clearStatus();
         resetResult();
-        setStatus("info", timestamped
-          ? "Fetching recording and generating a timestamped transcript with whisper-1. Large recordings can take a while."
-          : "Fetching recording and generating a plain JSON transcript with gpt-4o-mini-transcribe. Large recordings can take a while.");
+        setStatus("info", "Fetching recording, extracting the full MP3, uploading it to Gladia, and waiting for the final JSON result. Large recordings can take a while.");
 
         try {
           const headers = { "Content-Type": "application/json" };
@@ -364,7 +380,7 @@ APP_HTML = """<!doctype html>
           const response = await fetch("/api/transcribe", {
             method: "POST",
             headers,
-            body: JSON.stringify({ session_id: sessionId, timestamped })
+            body: JSON.stringify({ session_id: sessionId, timestamped: true })
           });
 
           const payload = await response.json();
@@ -391,11 +407,13 @@ class TranscriptRequest(BaseModel):
     session_id: str
     timestamped: bool = True
     async_mode: bool = False
+    gladia_options: dict[str, Any] | None = None
 
 
 class TranscriptJobRequest(BaseModel):
     session_id: str
     timestamped: bool = True
+    gladia_options: dict[str, Any] | None = None
 
 
 def _utc_now_iso() -> str:
@@ -421,7 +439,8 @@ def _parse_bool(value: object, default: bool = True) -> bool:
 
 
 def _build_output_path(session_id: str, timestamped: bool) -> Path:
-    suffix = "timestamped" if timestamped else "plain"
+    del timestamped
+    suffix = "verbose"
     output_dir = Path.cwd() / "outputs"
     output_dir.mkdir(parents=True, exist_ok=True)
     return output_dir / f"{session_id}.{suffix}.transcript.json"
@@ -445,7 +464,7 @@ def _serialize_transcription_exception(exc: Exception) -> tuple[int, str]:
     if isinstance(exc, RuntimeError):
         message = str(exc)
         status_code = 502
-        if "Missing OpenAI API key" in message or "Missing Livestorm API key" in message:
+        if "Missing Gladia API key" in message or "Missing Livestorm API key" in message:
             status_code = 500
         elif "No MP4 video recording found" in message:
             status_code = 404
@@ -453,24 +472,86 @@ def _serialize_transcription_exception(exc: Exception) -> tuple[int, str]:
     return 500, "Unexpected server error while generating the transcript."
 
 
-def _perform_transcription(session_id: str, timestamped: bool) -> dict[str, object]:
+def _sanitize_gladia_options(value: Any) -> Any:
+    if isinstance(value, dict):
+        sanitized: dict[str, Any] = {}
+        for key, item in value.items():
+            cleaned = _sanitize_gladia_options(item)
+            if cleaned is None:
+                continue
+            if cleaned == {}:
+                continue
+            if cleaned == []:
+                continue
+            sanitized[key] = cleaned
+        return sanitized
+    if isinstance(value, list):
+        sanitized_list = []
+        for item in value:
+            cleaned = _sanitize_gladia_options(item)
+            if cleaned is None:
+                continue
+            if cleaned == {}:
+                continue
+            if cleaned == []:
+                continue
+            sanitized_list.append(cleaned)
+        return sanitized_list
+    if isinstance(value, str):
+        stripped = value.strip()
+        return stripped or None
+    return value
+
+
+def _parse_gladia_options_query(raw_value: str | None) -> dict[str, Any] | None:
+    if raw_value is None:
+        return None
+    normalized = raw_value.strip()
+    if not normalized:
+        return None
+    try:
+        parsed = json.loads(normalized)
+    except json.JSONDecodeError as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid gladia_options JSON: {exc.msg}.") from exc
+    if not isinstance(parsed, dict):
+        raise HTTPException(status_code=400, detail="gladia_options must be a JSON object.")
+    sanitized = _sanitize_gladia_options(parsed)
+    return sanitized if isinstance(sanitized, dict) and sanitized else None
+
+
+def _perform_transcription(
+    session_id: str,
+    timestamped: bool,
+    gladia_options: dict[str, Any] | None = None,
+) -> dict[str, object]:
     session_id = session_id.strip()
     if not session_id:
         raise ValueError("Session ID is required.")
 
     output_path = _build_output_path(session_id, timestamped)
+    sanitized_gladia_options = _sanitize_gladia_options(gladia_options)
+    if not isinstance(sanitized_gladia_options, dict):
+        sanitized_gladia_options = None
     transcript = transcribe_livestorm_session_data(
         session_id=session_id,
         output_path=output_path,
-        timestamped=timestamped,
+        gladia_options=sanitized_gladia_options,
     )
 
     return {"transcript": transcript}
 
 
-def _transcribe_request(session_id: str, timestamped: bool) -> dict[str, object]:
+def _transcribe_request(
+    session_id: str,
+    timestamped: bool,
+    gladia_options: dict[str, Any] | None = None,
+) -> dict[str, object]:
     try:
-        return _perform_transcription(session_id=session_id, timestamped=timestamped)
+        return _perform_transcription(
+            session_id=session_id,
+            timestamped=timestamped,
+            gladia_options=gladia_options,
+        )
     except Exception as exc:
         status_code, detail = _serialize_transcription_exception(exc)
         raise HTTPException(status_code=status_code, detail=detail) from exc
@@ -495,7 +576,12 @@ class TranscriptJobManager:
             )
             self._thread.start()
 
-    def enqueue(self, session_id: str, timestamped: bool) -> dict[str, object]:
+    def enqueue(
+        self,
+        session_id: str,
+        timestamped: bool,
+        gladia_options: dict[str, Any] | None = None,
+    ) -> dict[str, object]:
         normalized_session_id = session_id.strip()
         if not normalized_session_id:
             raise HTTPException(status_code=400, detail="Session ID is required.")
@@ -505,6 +591,7 @@ class TranscriptJobManager:
             "job_id": job_id,
             "session_id": normalized_session_id,
             "timestamped": timestamped,
+            "gladia_options": gladia_options,
             "status": JOB_STATUS_QUEUED,
             "created_at": _utc_now_iso(),
             "updated_at": _utc_now_iso(),
@@ -566,6 +653,7 @@ class TranscriptJobManager:
                 result = _perform_transcription(
                     session_id=str(job["session_id"]),
                     timestamped=bool(job["timestamped"]),
+                    gladia_options=job.get("gladia_options"),
                 )
             except Exception as exc:
                 status_code, detail = _serialize_transcription_exception(exc)
@@ -669,17 +757,21 @@ def create_app() -> FastAPI:
         session_id: str = Query(...),
         verbose: str = Query("true"),
         async_mode: str = Query("false"),
+        gladia_options: str | None = Query(default=None),
     ) -> dict[str, object]:
+        parsed_gladia_options = _parse_gladia_options_query(gladia_options)
         if _parse_bool(async_mode, default=False):
             job = job_manager.enqueue(
                 session_id=session_id,
                 timestamped=_parse_bool(verbose, default=True),
+                gladia_options=parsed_gladia_options,
             )
             return fastapi_json_response(job, 202)
         return await run_in_threadpool(
             _transcribe_request,
             session_id=session_id,
             timestamped=_parse_bool(verbose, default=True),
+            gladia_options=parsed_gladia_options,
         )
 
     @app.post("/api/transcribe", dependencies=[Depends(_validate_api_key)])
@@ -689,6 +781,7 @@ def create_app() -> FastAPI:
                 job_manager.enqueue(
                     session_id=payload.session_id,
                     timestamped=payload.timestamped,
+                    gladia_options=payload.gladia_options,
                 ),
                 202,
             )
@@ -696,6 +789,7 @@ def create_app() -> FastAPI:
             _transcribe_request,
             session_id=payload.session_id,
             timestamped=payload.timestamped,
+            gladia_options=payload.gladia_options,
         )
 
     @app.post("/api/transcribe/jobs", dependencies=[Depends(_validate_api_key)])
@@ -704,6 +798,7 @@ def create_app() -> FastAPI:
             job_manager.enqueue(
                 session_id=payload.session_id,
                 timestamped=payload.timestamped,
+                gladia_options=payload.gladia_options,
             ),
             202,
         )
