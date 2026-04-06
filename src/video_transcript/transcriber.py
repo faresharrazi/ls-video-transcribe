@@ -4,6 +4,7 @@ import http.client
 import json
 import mimetypes
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -29,6 +30,7 @@ GLADIA_UPLOAD_PATH = "/v2/upload"
 GLADIA_PRE_RECORDED_PATH = "/v2/pre-recorded"
 GLADIA_POLL_INTERVAL_SECONDS = 3
 GLADIA_POLL_TIMEOUT_SECONDS = 30 * 60
+GLADIA_MAX_AUDIO_CHUNK_SECONDS = 60 * 60
 LIVESTORM_API_BASE = "https://api.livestorm.co/v1"
 DEFAULT_GLADIA_OPTIONS: dict[str, Any] = {
     "diarization": True,
@@ -90,6 +92,116 @@ def _extract_audio(video_path: Path, audio_path: Path) -> None:
     except subprocess.CalledProcessError as exc:
         stderr = exc.stderr.strip() if exc.stderr else "Unknown ffmpeg error"
         raise RuntimeError(f"Audio extraction failed: {stderr}") from exc
+
+
+def _ffprobe_executable() -> str | None:
+    ffmpeg_path = Path(_ffmpeg_executable())
+    sibling_ffprobe = ffmpeg_path.with_name("ffprobe")
+    if sibling_ffprobe.exists():
+        return str(sibling_ffprobe)
+    return shutil.which("ffprobe")
+
+
+def _parse_ffmpeg_duration(stderr: str) -> float | None:
+    match = re.search(r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)", stderr)
+    if not match:
+        return None
+
+    hours = int(match.group(1))
+    minutes = int(match.group(2))
+    seconds = float(match.group(3))
+    return (hours * 60 * 60) + (minutes * 60) + seconds
+
+
+def _probe_media_duration_seconds(media_path: Path) -> float | None:
+    ffprobe_path = _ffprobe_executable()
+    if ffprobe_path:
+        command = [
+            ffprobe_path,
+            "-v",
+            "error",
+            "-show_entries",
+            "format=duration",
+            "-of",
+            "json",
+            str(media_path),
+        ]
+        try:
+            completed = subprocess.run(command, check=True, capture_output=True, text=True)
+            payload = json.loads(completed.stdout or "{}")
+            duration = payload.get("format", {}).get("duration")
+            if isinstance(duration, str) and duration.strip():
+                return float(duration)
+            if isinstance(duration, (int, float)):
+                return float(duration)
+        except (subprocess.CalledProcessError, json.JSONDecodeError, ValueError):
+            pass
+
+    ffmpeg_command = [
+        _ffmpeg_executable(),
+        "-i",
+        str(media_path),
+        "-f",
+        "null",
+        "-",
+    ]
+    try:
+        completed = subprocess.run(ffmpeg_command, check=False, capture_output=True, text=True)
+    except subprocess.CalledProcessError:
+        return None
+    return _parse_ffmpeg_duration(completed.stderr or "")
+
+
+def _format_ffmpeg_segment_timestamp(total_seconds: int) -> str:
+    hours, remainder = divmod(total_seconds, 60 * 60)
+    minutes, seconds = divmod(remainder, 60)
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+
+
+def _split_audio_file(audio_path: Path, chunk_dir: Path) -> list[tuple[Path, float]]:
+    duration_seconds = _probe_media_duration_seconds(audio_path)
+    if duration_seconds is None or duration_seconds <= GLADIA_MAX_AUDIO_CHUNK_SECONDS:
+        return [(audio_path, 0.0)]
+
+    ffmpeg_path = _ffmpeg_executable()
+    chunk_dir.mkdir(parents=True, exist_ok=True)
+    chunk_pattern = chunk_dir / f"{audio_path.stem}.chunk-%03d{audio_path.suffix}"
+    command = [
+        ffmpeg_path,
+        "-y",
+        "-i",
+        str(audio_path),
+        "-f",
+        "segment",
+        "-segment_time",
+        _format_ffmpeg_segment_timestamp(GLADIA_MAX_AUDIO_CHUNK_SECONDS),
+        "-c",
+        "copy",
+        "-reset_timestamps",
+        "1",
+        str(chunk_pattern),
+    ]
+
+    try:
+        subprocess.run(command, check=True, capture_output=True, text=True)
+    except subprocess.CalledProcessError as exc:
+        stderr = exc.stderr.strip() if exc.stderr else "Unknown ffmpeg error"
+        raise RuntimeError(f"Audio splitting failed: {stderr}") from exc
+
+    chunk_paths = sorted(chunk_dir.glob(f"{audio_path.stem}.chunk-*{audio_path.suffix}"))
+    if not chunk_paths:
+        raise RuntimeError("Audio splitting failed: no chunk files were created.")
+
+    chunk_specs: list[tuple[Path, float]] = []
+    next_offset_seconds = 0.0
+    for chunk_path in chunk_paths:
+        chunk_specs.append((chunk_path, next_offset_seconds))
+        chunk_duration = _probe_media_duration_seconds(chunk_path)
+        if chunk_duration is None or chunk_duration <= 0:
+            raise RuntimeError(f"Audio splitting failed: could not determine duration for chunk {chunk_path.name}.")
+        next_offset_seconds += chunk_duration
+
+    return chunk_specs
 
 
 def _json_request(
@@ -179,6 +291,32 @@ def _build_gladia_request(audio_url: str, gladia_options: dict[str, Any] | None 
     request_payload.pop("audio_to_llm_config", None)
     request_payload["audio_url"] = audio_url
     return request_payload
+
+
+def _transcribe_audio_file(
+    audio_path: Path,
+    *,
+    api_key: str,
+    gladia_options: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    upload_payload = _upload_audio_file(audio_path, api_key)
+    audio_url = upload_payload.get("audio_url")
+    if not isinstance(audio_url, str) or not audio_url.strip():
+        raise RuntimeError("Gladia upload succeeded but no audio_url was returned.")
+
+    gladia_request = _build_gladia_request(audio_url, gladia_options)
+    started_job = _start_gladia_transcription(audio_url, api_key, gladia_options)
+    job_id = started_job.get("id")
+    if not isinstance(job_id, str) or not job_id.strip():
+        raise RuntimeError("Gladia transcription request succeeded but no job id was returned.")
+
+    gladia_result = _poll_gladia_transcription(job_id, api_key)
+    return {
+        "upload_payload": upload_payload,
+        "gladia_request": gladia_request,
+        "started_job": started_job,
+        "gladia_result": gladia_result,
+    }
 
 
 def _start_gladia_transcription(audio_url: str, api_key: str, gladia_options: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -305,6 +443,108 @@ def _extract_language(gladia_payload: dict[str, Any]) -> str | None:
     return None
 
 
+def _shift_timecode(value: Any, offset_seconds: float) -> Any:
+    if isinstance(value, (int, float)):
+        return value + offset_seconds
+    return value
+
+
+def _shift_timed_dict(entry: dict[str, Any], offset_seconds: float) -> dict[str, Any]:
+    shifted = dict(entry)
+    for key in ("start", "end"):
+        shifted[key] = _shift_timecode(shifted.get(key), offset_seconds)
+    return shifted
+
+
+def _merge_chunk_results(chunk_results: list[dict[str, Any]]) -> dict[str, Any]:
+    if not chunk_results:
+        raise RuntimeError("No chunk transcriptions were produced.")
+
+    if len(chunk_results) == 1:
+        return dict(chunk_results[0]["gladia_result"])
+
+    merged_payload = json.loads(json.dumps(chunk_results[0]["gladia_result"]))
+    merged_payload["status"] = "done"
+
+    merged_text_parts: list[str] = []
+    merged_utterances: list[dict[str, Any]] = []
+    merged_words: list[dict[str, Any]] = []
+    merged_sentences: list[dict[str, Any]] = []
+    merged_duration_seconds = 0.0
+    detected_language: str | None = None
+
+    for index, chunk_result in enumerate(chunk_results, start=1):
+        chunk_payload = chunk_result["gladia_result"]
+        offset_seconds = float(chunk_result.get("offset_seconds") or 0.0)
+        duration_seconds = _extract_duration_seconds(chunk_payload) or 0.0
+        merged_duration_seconds = max(merged_duration_seconds, offset_seconds + duration_seconds)
+        if detected_language is None:
+            detected_language = _extract_language(chunk_payload)
+
+        result = chunk_payload.get("result")
+        transcription = result.get("transcription") if isinstance(result, dict) else None
+        if isinstance(transcription, dict):
+            full_transcript = str(transcription.get("full_transcript") or "").strip()
+            if full_transcript:
+                merged_text_parts.append(full_transcript)
+
+            utterances = transcription.get("utterances")
+            if isinstance(utterances, list):
+                for utterance in utterances:
+                    if isinstance(utterance, dict):
+                        merged_utterances.append(_shift_timed_dict(utterance, offset_seconds))
+
+            words = transcription.get("words")
+            if isinstance(words, list):
+                for word in words:
+                    if isinstance(word, dict):
+                        merged_words.append(_shift_timed_dict(word, offset_seconds))
+
+            sentences = transcription.get("sentences")
+            if isinstance(sentences, list):
+                for sentence in sentences:
+                    if isinstance(sentence, dict):
+                        merged_sentences.append(_shift_timed_dict(sentence, offset_seconds))
+
+    merged_result = merged_payload.setdefault("result", {})
+    if not isinstance(merged_result, dict):
+        merged_result = {}
+        merged_payload["result"] = merged_result
+
+    merged_transcription = merged_result.setdefault("transcription", {})
+    if not isinstance(merged_transcription, dict):
+        merged_transcription = {}
+        merged_result["transcription"] = merged_transcription
+
+    merged_transcription["full_transcript"] = "\n\n".join(merged_text_parts).strip()
+    for utterance_index, utterance in enumerate(merged_utterances, start=1):
+        utterance["id"] = utterance_index
+    merged_transcription["utterances"] = merged_utterances
+    merged_transcription["words"] = merged_words
+    if merged_sentences:
+        merged_transcription["sentences"] = merged_sentences
+
+    existing_languages = merged_transcription.get("languages")
+    if not existing_languages and detected_language:
+        merged_transcription["languages"] = [detected_language]
+
+    metadata = merged_result.setdefault("metadata", {})
+    if not isinstance(metadata, dict):
+        metadata = {}
+        merged_result["metadata"] = metadata
+    metadata["audio_duration"] = merged_duration_seconds
+    if detected_language and not metadata.get("language"):
+        metadata["language"] = detected_language
+
+    file_data = merged_payload.get("file")
+    if isinstance(file_data, dict):
+        file_data["audio_duration"] = merged_duration_seconds
+        if file_data.get("duration") is not None:
+            file_data["duration"] = merged_duration_seconds
+
+    return merged_payload
+
+
 def _normalize_transcription(
     gladia_payload: dict[str, Any],
     *,
@@ -421,19 +661,19 @@ def transcribe_video(
     actual_model = DEFAULT_MODEL
 
     with tempfile.TemporaryDirectory(prefix="video-transcript-") as temp_dir:
-        temp_audio = Path(temp_dir) / f"{source_video.stem}.mp3"
+        temp_dir_path = Path(temp_dir)
+        temp_audio = temp_dir_path / f"{source_video.stem}.mp3"
         _extract_audio(source_video, temp_audio)
-        upload_payload = _upload_audio_file(temp_audio, api_key)
-        audio_url = upload_payload.get("audio_url")
-        if not isinstance(audio_url, str) or not audio_url.strip():
-            raise RuntimeError("Gladia upload succeeded but no audio_url was returned.")
+        chunk_specs = _split_audio_file(temp_audio, temp_dir_path / "audio-chunks")
 
-        gladia_request = _build_gladia_request(audio_url, gladia_options)
-        started_job = _start_gladia_transcription(audio_url, api_key, gladia_options)
-        job_id = started_job.get("id")
-        if not isinstance(job_id, str) or not job_id.strip():
-            raise RuntimeError("Gladia transcription request succeeded but no job id was returned.")
-        gladia_result = _poll_gladia_transcription(job_id, api_key)
+        chunk_results: list[dict[str, Any]] = []
+        for chunk_path, offset_seconds in chunk_specs:
+            chunk_result = _transcribe_audio_file(chunk_path, api_key=api_key, gladia_options=gladia_options)
+            chunk_result["offset_seconds"] = offset_seconds
+            chunk_result["audio_path"] = str(chunk_path)
+            chunk_results.append(chunk_result)
+
+        gladia_result = _merge_chunk_results(chunk_results)
 
         extracted_audio: Path | None = None
         if keep_audio:
@@ -446,10 +686,10 @@ def transcribe_video(
             extracted_audio=extracted_audio,
             requested_model=requested_model,
             actual_model=actual_model,
-            upload_payload=upload_payload,
-            gladia_request=gladia_request,
+            upload_payload=chunk_results[0]["upload_payload"],
+            gladia_request=chunk_results[0]["gladia_request"],
         )
-        normalized["job"] = started_job
+        normalized["job"] = chunk_results[0]["started_job"]
         output_file.write_text(json.dumps(normalized, indent=2, ensure_ascii=True) + "\n")
 
     return output_file

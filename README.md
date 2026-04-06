@@ -12,6 +12,7 @@ Small Python app with:
 - It downmixes to mono.
 - It resamples to `16 kHz`.
 - It compresses the extracted audio to a low bitrate MP3 before upload.
+- It automatically splits extracted MP3s longer than 60 minutes into smaller chunks, transcribes them separately, and concatenates the final result back into one JSON response.
 - It downloads the recording only after resolving the MP4 URL from Livestorm.
 - It extracts audio locally so Gladia receives the full MP3 rather than the source video file.
 - It keeps the API session-based so other apps can continue calling the same endpoints.
