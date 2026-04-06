@@ -18,6 +18,13 @@ from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel
 import uvicorn
 
+try:
+    import psycopg
+    from psycopg.rows import dict_row
+except ModuleNotFoundError:
+    psycopg = None
+    dict_row = None
+
 from .transcriber import transcribe_livestorm_session_data
 
 logger = logging.getLogger(__name__)
@@ -32,17 +39,15 @@ APP_HTML = """<!doctype html>
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Video Transcript</title>
+    <title>Video Transcript Test UI</title>
     <style>
       :root {
-        --bg: #f4efe4;
-        --panel: rgba(255, 250, 241, 0.88);
-        --panel-strong: #fffaf1;
         --text: #1f1b17;
         --muted: #6b6257;
         --accent: #0b6e4f;
         --danger: #a4372f;
         --border: rgba(31, 27, 23, 0.12);
+        --panel: rgba(255, 252, 246, 0.92);
         --shadow: 0 18px 50px rgba(60, 40, 20, 0.12);
       }
 
@@ -58,20 +63,17 @@ APP_HTML = """<!doctype html>
           linear-gradient(135deg, #efe7d5 0%, #f9f6ef 46%, #ece4d2 100%);
       }
       .shell {
-        width: min(1260px, calc(100vw - 32px));
+        width: min(960px, calc(100vw - 32px));
         margin: 32px auto;
-        display: grid;
-        grid-template-columns: minmax(320px, 460px) minmax(0, 1fr);
-        gap: 24px;
       }
       .card {
+        padding: 28px;
         background: var(--panel);
         backdrop-filter: blur(10px);
         border: 1px solid var(--border);
         border-radius: 24px;
         box-shadow: var(--shadow);
       }
-      .sidebar { padding: 28px; }
       .eyebrow {
         display: inline-block;
         margin-bottom: 12px;
@@ -93,15 +95,12 @@ APP_HTML = """<!doctype html>
         color: var(--muted);
         line-height: 1.6;
       }
-      .field {
-        margin-bottom: 14px;
-      }
       label {
         display: block;
-        font-size: 0.95rem;
         margin-bottom: 8px;
+        font-size: 0.95rem;
       }
-      input[type="text"], input[type="password"], textarea {
+      input[type="text"] {
         width: 100%;
         padding: 14px 16px;
         border: 1px solid var(--border);
@@ -110,45 +109,11 @@ APP_HTML = """<!doctype html>
         font: inherit;
         color: var(--text);
       }
-      textarea {
-        min-height: 110px;
-        resize: vertical;
-      }
-      input[type="text"]:focus, input[type="password"]:focus, textarea:focus {
+      input[type="text"]:focus {
         outline: 2px solid rgba(11, 110, 79, 0.2);
         border-color: rgba(11, 110, 79, 0.38);
       }
-      .toggle {
-        display: flex;
-        align-items: flex-start;
-        gap: 12px;
-        padding: 14px 16px;
-        border-radius: 16px;
-        background: rgba(255, 253, 248, 0.8);
-        border: 1px solid var(--border);
-      }
-      .toggle + .toggle { margin-top: 10px; }
-      .toggle input[type="checkbox"] {
-        width: 18px;
-        height: 18px;
-        accent-color: var(--accent);
-        margin: 2px 0 0;
-      }
-      .toggle-copy {
-        display: flex;
-        flex-direction: column;
-        gap: 4px;
-      }
-      .toggle-copy strong { font-size: 0.96rem; }
-      .toggle-copy span {
-        color: var(--muted);
-        font-size: 0.88rem;
-        line-height: 1.4;
-      }
       .actions {
-        display: flex;
-        align-items: center;
-        gap: 12px;
         margin-top: 18px;
       }
       button {
@@ -159,26 +124,20 @@ APP_HTML = """<!doctype html>
         color: white;
         font: inherit;
         cursor: pointer;
-        transition: transform 120ms ease, box-shadow 120ms ease;
         box-shadow: 0 12px 24px rgba(11, 110, 79, 0.18);
       }
-      button:hover { transform: translateY(-1px); }
       button:disabled {
         opacity: 0.65;
         cursor: wait;
-        transform: none;
       }
       .hint {
         margin-top: 14px;
-        font-size: 0.92rem;
         color: var(--muted);
         line-height: 1.5;
+        font-size: 0.92rem;
       }
       .results {
-        padding: 24px;
-        display: flex;
-        flex-direction: column;
-        min-height: 70vh;
+        margin-top: 20px;
       }
       .status {
         display: none;
@@ -196,118 +155,67 @@ APP_HTML = """<!doctype html>
         background: rgba(164, 55, 47, 0.08);
         color: var(--danger);
       }
-      .metrics {
-        display: none;
-        grid-template-columns: repeat(4, minmax(0, 1fr));
-        gap: 12px;
-        margin-bottom: 18px;
-      }
-      .metrics.visible { display: grid; }
-      .metric {
-        padding: 14px;
-        border-radius: 18px;
-        background: var(--panel-strong);
-        border: 1px solid var(--border);
-      }
-      .metric span {
-        display: block;
-        color: var(--muted);
-        font-size: 0.82rem;
-        margin-bottom: 6px;
-      }
-      .metric strong {
-        font-size: 1rem;
-        word-break: break-word;
-      }
       .panel {
         padding: 18px;
         border-radius: 20px;
         background: rgba(255, 253, 248, 0.82);
         border: 1px solid var(--border);
       }
-      .panel + .panel { margin-top: 16px; }
       .panel h2 {
         margin: 0 0 12px;
         font-size: 1rem;
       }
-      .transcript {
-        white-space: pre-wrap;
-        line-height: 1.7;
-      }
-      pre {
-        margin: 0;
-        overflow: auto;
-        white-space: pre-wrap;
-        word-break: break-word;
-        font-family: "SFMono-Regular", Menlo, monospace;
-        font-size: 0.9rem;
-      }
       .empty {
-        margin: auto 0;
+        padding: 32px 16px;
         text-align: center;
         color: var(--muted);
         line-height: 1.7;
       }
-      @media (max-width: 980px) {
-        .shell { grid-template-columns: 1fr; }
-        .results { min-height: auto; }
-        .metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      pre {
+        margin: 0;
+        min-height: 420px;
+        overflow: auto;
+        white-space: pre;
+        font-family: "SFMono-Regular", Menlo, monospace;
+        font-size: 0.9rem;
       }
       @media (max-width: 640px) {
-        .metrics { grid-template-columns: 1fr; }
+        .card { padding: 20px; }
       }
     </style>
   </head>
   <body>
     <main class="shell">
-      <section class="card sidebar">
-        <div class="eyebrow">Livestorm to Transcript</div>
-        <h1>Gladia Session to JSON</h1>
-        <p class="lead">Paste a Livestorm session ID and the app will fetch the recording, extract the full MP3, send it to Gladia, and return the resulting JSON plus a readable transcript preview.</p>
+      <section class="card">
+        <div class="eyebrow">Online Test UI</div>
+        <h1>Session to Raw JSON</h1>
+        <p class="lead">Paste a Livestorm session ID and this page will run the built-in transcription flow, then show the raw JSON response.</p>
         <form id="transcript-form">
-          <div class="field">
-            <label for="session-id">Session ID</label>
-            <input id="session-id" name="session_id" type="text" placeholder="fdbd0600-9a46-4755-b25b-21b51d4e29cb" autocomplete="off" required>
-          </div>
-          <div class="field">
-            <label for="api-key">API Key</label>
-            <input id="api-key" name="api_key" type="password" placeholder="Optional unless server auth is enabled" autocomplete="off">
-          </div>
+          <label for="session-id">Session ID</label>
+          <input id="session-id" name="session_id" type="text" placeholder="fdbd0600-9a46-4755-b25b-21b51d4e29cb" autocomplete="off" required>
           <div class="actions">
-            <button id="submit-btn" type="submit">Generate Transcript</button>
+            <button id="submit-btn" type="submit">Fetch JSON</button>
           </div>
         </form>
-        <p class="hint">Every request now includes the same Gladia profile: diarization, named entity recognition, and sentences.</p>
-      </section>
-      <section class="card results">
-        <div id="status" class="status"></div>
-        <div id="metrics" class="metrics">
-          <div class="metric"><span>Session</span><strong id="metric-session">-</strong></div>
-          <div class="metric"><span>Language</span><strong id="metric-language">-</strong></div>
-          <div class="metric"><span>Duration</span><strong id="metric-duration">-</strong></div>
-          <div class="metric"><span>Segments</span><strong id="metric-segments">-</strong></div>
-        </div>
-        <div id="empty-state" class="empty">Transcript output will appear here once a session is processed.</div>
-        <div id="result-content" style="display:none;">
-          <div class="panel">
-            <h2>Transcript</h2>
-            <div id="transcript-text" class="transcript"></div>
+        <p class="hint">This page is for built-in testing only. Protected API routes can still require <code>API_AUTH_KEY</code>.</p>
+        <section class="results">
+          <div id="status" class="status"></div>
+          <div id="empty-state" class="empty">Raw JSON output will appear here once a session is processed.</div>
+          <div id="result-content" style="display:none;">
+            <div class="panel">
+              <h2>JSON Output</h2>
+              <pre id="json-output"></pre>
+            </div>
           </div>
-          <div class="panel">
-            <h2>JSON Output</h2>
-            <pre id="json-output"></pre>
-          </div>
-        </div>
+        </section>
       </section>
     </main>
     <script>
       const form = document.getElementById("transcript-form");
       const button = document.getElementById("submit-btn");
       const statusEl = document.getElementById("status");
-      const metricsEl = document.getElementById("metrics");
       const emptyEl = document.getElementById("empty-state");
       const resultContentEl = document.getElementById("result-content");
-      const transcriptTextEl = document.getElementById("transcript-text");
       const jsonOutputEl = document.getElementById("json-output");
 
       function setStatus(kind, message) {
@@ -322,43 +230,24 @@ APP_HTML = """<!doctype html>
 
       function setBusy(isBusy) {
         button.disabled = isBusy;
-        button.textContent = isBusy ? "Working..." : "Generate Transcript";
-      }
-
-      function transcriptText(data) {
-        if (data.text) {
-          return data.text;
-        }
-        if (data.result && data.result.transcription && data.result.transcription.full_transcript) {
-          return data.result.transcription.full_transcript;
-        }
-        return "(No transcript text returned)";
-      }
-
-      function renderTranscript(data) {
-        document.getElementById("metric-session").textContent = data.session_id || "-";
-        document.getElementById("metric-language").textContent = data.language || "unknown";
-        document.getElementById("metric-duration").textContent = data.duration_seconds != null ? `${data.duration_seconds}s` : "-";
-        document.getElementById("metric-segments").textContent = Array.isArray(data.segments) ? String(data.segments.length) : "n/a";
-        transcriptTextEl.textContent = transcriptText(data);
-        jsonOutputEl.textContent = JSON.stringify(data, null, 2);
-        metricsEl.classList.add("visible");
-        emptyEl.style.display = "none";
-        resultContentEl.style.display = "block";
+        button.textContent = isBusy ? "Working..." : "Fetch JSON";
       }
 
       function resetResult() {
-        metricsEl.classList.remove("visible");
         emptyEl.style.display = "block";
         resultContentEl.style.display = "none";
-        transcriptTextEl.textContent = "";
         jsonOutputEl.textContent = "";
+      }
+
+      function renderResult(data) {
+        jsonOutputEl.textContent = JSON.stringify(data, null, 2);
+        emptyEl.style.display = "none";
+        resultContentEl.style.display = "block";
       }
 
       form.addEventListener("submit", async (event) => {
         event.preventDefault();
         const sessionId = document.getElementById("session-id").value.trim();
-        const apiKey = document.getElementById("api-key").value.trim();
 
         if (!sessionId) {
           resetResult();
@@ -369,17 +258,12 @@ APP_HTML = """<!doctype html>
         setBusy(true);
         clearStatus();
         resetResult();
-        setStatus("info", "Fetching recording, extracting the full MP3, uploading it to Gladia, and waiting for the final JSON result. Large recordings can take a while.");
+        setStatus("info", "Fetching the recording and waiting for the final JSON result. Large sessions can take a while.");
 
         try {
-          const headers = { "Content-Type": "application/json" };
-          if (apiKey) {
-            headers["X-API-Key"] = apiKey;
-          }
-
-          const response = await fetch("/api/transcribe", {
+          const response = await fetch("/ui/transcribe", {
             method: "POST",
-            headers,
+            headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ session_id: sessionId, timestamped: true })
           });
 
@@ -389,7 +273,7 @@ APP_HTML = """<!doctype html>
           }
 
           clearStatus();
-          renderTranscript(payload.transcript);
+          renderResult(payload.transcript);
         } catch (error) {
           resetResult();
           setStatus("error", error.message || "Something went wrong while generating the transcript.");
@@ -441,13 +325,62 @@ def _parse_bool(value: object, default: bool = True) -> bool:
 def _build_output_path(session_id: str, timestamped: bool) -> Path:
     del timestamped
     suffix = "verbose"
-    output_dir = Path.cwd() / "outputs"
+    output_dir = _storage_root() / "outputs"
     output_dir.mkdir(parents=True, exist_ok=True)
     return output_dir / f"{session_id}.{suffix}.transcript.json"
 
 
+def _storage_root() -> Path:
+    configured = os.getenv("TRANSCRIPT_STORAGE_DIR", "").strip()
+    if configured:
+        return Path(configured).expanduser().resolve()
+    return Path.cwd()
+
+
+def _database_url() -> str | None:
+    load_dotenv()
+    configured = os.getenv("DATABASE_URL", "").strip()
+    return configured or None
+
+
+def _postgres_enabled() -> bool:
+    return _database_url() is not None
+
+
+def _connect_db():
+    database_url = _database_url()
+    if not database_url:
+        raise RuntimeError("DATABASE_URL is not configured.")
+    if psycopg is None or dict_row is None:
+        raise RuntimeError("psycopg is required when DATABASE_URL is configured. Install dependencies again.")
+    return psycopg.connect(database_url, autocommit=True, row_factory=dict_row)
+
+
+def _serialize_json_field(value: Any) -> str | None:
+    if value is None:
+        return None
+    return json.dumps(value, ensure_ascii=True)
+
+
+def _deserialize_json_field(value: Any) -> Any:
+    if value in (None, ""):
+        return None
+    if isinstance(value, (dict, list)):
+        return value
+    if isinstance(value, str):
+        return json.loads(value)
+    return value
+
+
+def _normalize_job_record(row: dict[str, Any]) -> dict[str, object]:
+    normalized = dict(row)
+    for key in ("gladia_options", "result", "error"):
+        normalized[key] = _deserialize_json_field(normalized.get(key))
+    return normalized
+
+
 def _build_jobs_dir() -> Path:
-    jobs_dir = Path.cwd() / "outputs" / "jobs"
+    jobs_dir = _storage_root() / "outputs" / "jobs"
     jobs_dir.mkdir(parents=True, exist_ok=True)
     return jobs_dir
 
@@ -568,6 +501,7 @@ class TranscriptJobManager:
         with self._lock:
             if self._thread and self._thread.is_alive():
                 return
+            self._initialize_storage_locked()
             self._recover_jobs_locked()
             self._thread = threading.Thread(
                 target=self._worker_loop,
@@ -605,7 +539,15 @@ class TranscriptJobManager:
     def get(self, job_id: str) -> dict[str, object]:
         job = self._read_job(job_id)
         if job is None:
-            raise HTTPException(status_code=404, detail="Transcript job not found.")
+            storage_root = _storage_root()
+            raise HTTPException(
+                status_code=404,
+                detail=(
+                    "Transcript job not found. "
+                    f"Current job storage directory: {storage_root}. "
+                    "If this service restarted or uses non-persistent storage, async jobs can disappear."
+                ),
+            )
         return job
 
     def _enqueue_job_id(self, job_id: str) -> None:
@@ -615,7 +557,30 @@ class TranscriptJobManager:
             self._queued_job_ids.add(job_id)
             self._queue.put(job_id)
 
+    def _initialize_storage_locked(self) -> None:
+        if not _postgres_enabled():
+            return
+        with _connect_db() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS transcript_jobs (
+                    job_id TEXT PRIMARY KEY,
+                    session_id TEXT NOT NULL,
+                    timestamped BOOLEAN NOT NULL,
+                    gladia_options TEXT NULL,
+                    status TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    result TEXT NULL,
+                    error TEXT NULL
+                )
+                """
+            )
+
     def _recover_jobs_locked(self) -> None:
+        if _postgres_enabled():
+            self._recover_db_jobs_locked()
+            return
         for job_file in _build_jobs_dir().glob("*.json"):
             try:
                 job = json.loads(job_file.read_text())
@@ -634,20 +599,35 @@ class TranscriptJobManager:
                 self._queued_job_ids.add(job_id)
                 self._queue.put(job_id)
 
+    def _recover_db_jobs_locked(self) -> None:
+        with _connect_db() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                """
+                UPDATE transcript_jobs
+                SET status = %s, updated_at = %s
+                WHERE status IN (%s, %s)
+                RETURNING job_id
+                """,
+                (JOB_STATUS_QUEUED, _utc_now_iso(), JOB_STATUS_QUEUED, JOB_STATUS_RUNNING),
+            )
+            rows = cursor.fetchall()
+
+        for row in rows:
+            job_id = str(row.get("job_id") or "").strip()
+            if job_id and job_id not in self._queued_job_ids:
+                self._queued_job_ids.add(job_id)
+                self._queue.put(job_id)
+
     def _worker_loop(self) -> None:
         while True:
             job_id = self._queue.get()
             with self._lock:
                 self._queued_job_ids.discard(job_id)
 
-            job = self._read_job(job_id)
+            job = self._claim_job(job_id)
             if job is None:
                 self._queue.task_done()
                 continue
-
-            job["status"] = JOB_STATUS_RUNNING
-            job["updated_at"] = _utc_now_iso()
-            self._write_job(job)
 
             try:
                 result = _perform_transcription(
@@ -674,7 +654,47 @@ class TranscriptJobManager:
             self._write_job(job)
             self._queue.task_done()
 
+    def _claim_job(self, job_id: str) -> dict[str, object] | None:
+        if _postgres_enabled():
+            with _connect_db() as connection, connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    UPDATE transcript_jobs
+                    SET status = %s, updated_at = %s
+                    WHERE job_id = %s AND status = %s
+                    RETURNING job_id, session_id, timestamped, gladia_options, status, created_at, updated_at, result, error
+                    """,
+                    (JOB_STATUS_RUNNING, _utc_now_iso(), job_id, JOB_STATUS_QUEUED),
+                )
+                row = cursor.fetchone()
+            if row is None:
+                return None
+            return _normalize_job_record(row)
+
+        job = self._read_job(job_id)
+        if job is None:
+            return None
+        if job.get("status") != JOB_STATUS_QUEUED:
+            return None
+        job["status"] = JOB_STATUS_RUNNING
+        job["updated_at"] = _utc_now_iso()
+        self._write_job(job)
+        return job
+
     def _read_job(self, job_id: str) -> dict[str, object] | None:
+        if _postgres_enabled():
+            with _connect_db() as connection, connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT job_id, session_id, timestamped, gladia_options, status, created_at, updated_at, result, error
+                    FROM transcript_jobs
+                    WHERE job_id = %s
+                    """,
+                    (job_id,),
+                )
+                row = cursor.fetchone()
+            return _normalize_job_record(row) if row is not None else None
+
         job_path = _build_job_path(job_id)
         if not job_path.exists():
             return None
@@ -685,6 +705,45 @@ class TranscriptJobManager:
             raise HTTPException(status_code=500, detail="Unable to read transcript job state.")
 
     def _write_job(self, job: dict[str, object]) -> None:
+        if _postgres_enabled():
+            with _connect_db() as connection, connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    INSERT INTO transcript_jobs (
+                        job_id,
+                        session_id,
+                        timestamped,
+                        gladia_options,
+                        status,
+                        created_at,
+                        updated_at,
+                        result,
+                        error
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (job_id) DO UPDATE SET
+                        session_id = EXCLUDED.session_id,
+                        timestamped = EXCLUDED.timestamped,
+                        gladia_options = EXCLUDED.gladia_options,
+                        status = EXCLUDED.status,
+                        created_at = EXCLUDED.created_at,
+                        updated_at = EXCLUDED.updated_at,
+                        result = EXCLUDED.result,
+                        error = EXCLUDED.error
+                    """,
+                    (
+                        str(job["job_id"]),
+                        str(job["session_id"]),
+                        bool(job["timestamped"]),
+                        _serialize_json_field(job.get("gladia_options")),
+                        str(job["status"]),
+                        str(job["created_at"]),
+                        str(job["updated_at"]),
+                        _serialize_json_field(job.get("result")),
+                        _serialize_json_field(job.get("error")),
+                    ),
+                )
+            return
+
         job_path = _build_job_path(str(job["job_id"]))
         temp_path = job_path.with_suffix(".json.tmp")
         temp_path.write_text(json.dumps(job, indent=2, ensure_ascii=True) + "\n")
@@ -751,6 +810,15 @@ def create_app() -> FastAPI:
     @app.get("/health")
     async def health() -> dict[str, str]:
         return {"status": "ok"}
+
+    @app.post("/ui/transcribe")
+    async def ui_transcript(payload: TranscriptRequest) -> dict[str, object]:
+        return await run_in_threadpool(
+            _transcribe_request,
+            session_id=payload.session_id,
+            timestamped=payload.timestamped,
+            gladia_options=payload.gladia_options,
+        )
 
     @app.get("/api/transcribe", dependencies=[Depends(_validate_api_key)])
     async def get_transcript(

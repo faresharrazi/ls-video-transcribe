@@ -15,3 +15,5 @@ services:
         sync: false
       - key: CORS_ALLOW_ORIGINS
         sync: false
+      - key: TRANSCRIPT_STORAGE_DIR
+        sync: false
